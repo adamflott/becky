@@ -3474,7 +3474,9 @@ dependencies = [
 
 [[package]]
 name = "wora"
-version = "0.0.12"
+version = "0.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bd700d817d4aa2e5c297818e14eb0bb3b7ae8a735b0e3bf01ac185e63aa0c90"
 dependencies = [
  "async-trait",
  "caps",
