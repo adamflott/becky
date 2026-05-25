@@ -149,6 +149,13 @@ pub struct FxSystemCommand {
     pub pin_to_cpus: Option<Vec<usize>>,
 }
 
+struct SystemProcessRunningTokio {
+    handle: JoinHandle<tokio::io::Result<ExitStatus>>,
+    tx: Sender<()>,
+    pid: u32,
+    child: Arc<RwLock<tokio::process::Child>>,
+}
+
 /// A running process associated with an [`FxSystemCommand`].
 ///
 /// Commands started by this controller are represented by [`Self::Tokio`],
@@ -160,7 +167,7 @@ pub enum FxSystemProcessRunning {
     ///
     /// The tuple contains the waiter task, a shutdown channel, the child pid,
     /// and the shared child handle.
-    Tokio((JoinHandle<tokio::io::Result<ExitStatus>>, Sender<()>, u32, Arc<RwLock<tokio::process::Child>>)),
+    Tokio(SystemProcessRunningTokio),
 
     // created by another process
     /// A process that already existed and is tracked only by pid.
@@ -233,8 +240,8 @@ impl FxAccounting for FxSystemProcessRunning {
 impl Debug for FxSystemProcessRunning {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            FxSystemProcessRunning::Tokio((handle, _tx, pid, _child)) => {
-                write!(f, "tokio process: {:?} pid:{}", handle, pid)
+            FxSystemProcessRunning::Tokio(handle) => {
+                write!(f, "tokio process: {:?} pid:{}", handle.handle, handle.pid)
             }
             FxSystemProcessRunning::Pid(pid) => {
                 write!(f, "pid process: {:?}", pid)
@@ -247,7 +254,7 @@ impl FxSystemProcessRunning {
     /// Returns the operating-system process id for this running process.
     pub fn get_pid(&self) -> u32 {
         match self {
-            FxSystemProcessRunning::Tokio((_handle, _tx, pid, _child)) => *pid,
+            FxSystemProcessRunning::Tokio(handle) => handle.pid,
             FxSystemProcessRunning::Pid(pid) => *pid,
         }
     }
@@ -528,18 +535,17 @@ impl FxControl for FxSystemCommand {
                 let maybe_pid = child.id();
                 let shared_child = Arc::new(RwLock::new(child));
 
-                let mut pid = 0;
-                match maybe_pid {
+                let pid = match maybe_pid {
                     None => {
                         self.state = FxExecutionState::Unknown;
                         return Err(FxSysCommandError::String("pid is None".to_string()));
                     }
                     Some(found_pid) => {
                         self.state = FxExecutionState::Running(found_pid);
-                        pid = found_pid;
-                        info!("spawned process {} {:?} at pid {:?}", self.command, self.args, pid);
+                        info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
+                        found_pid
                     }
-                }
+                };
                 let value = shared_child.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(1);
                 let handle = tokio::spawn(async move {
@@ -550,7 +556,13 @@ impl FxControl for FxSystemCommand {
                     value.write().await.wait().await
                 });
 
-                Ok(FxSystemProcessRunning::Tokio((handle, tx, pid, shared_child)))
+                let handle = SystemProcessRunningTokio {
+                    handle,
+                    tx,
+                    pid,
+                    child: shared_child,
+                };
+                Ok(FxSystemProcessRunning::Tokio(handle))
             }
         }
     }
@@ -569,9 +581,9 @@ impl FxControl for FxSystemCommand {
     /// report their observed state through `Ok(...)`.
     async fn fx_status(&mut self, process: &mut Self::FxSpawnResult) -> Result<Self::FxStatusResult, Self::FxStatusError> {
         match process {
-            FxSystemProcessRunning::Tokio((_handle, _tx, pid, child)) => match child.write().await.try_wait() {
+            FxSystemProcessRunning::Tokio(handle) => match handle.child.write().await.try_wait() {
                 Ok(maybe_exit_status) => match maybe_exit_status {
-                    None => Ok(FxExecutionState::Running(*pid)),
+                    None => Ok(FxExecutionState::Running(handle.pid)),
                     Some(exit_status) => Ok(FxExecutionState::Exited(exit_status)),
                 },
                 Err(err) => Err(FxExecutionState::Error(err.to_string())),
