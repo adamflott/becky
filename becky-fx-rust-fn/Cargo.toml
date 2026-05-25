@@ -1,0 +1,30 @@
+[package]
+name = "becky-fx-rust-fn"
+description = "Becky f(x): Rust function workers"
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+becky-engine = { version = "*", path = "../becky-engine" }
+becky-fx-id = { version = "*", path = "../becky-fx-id" }
+bon = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["serde"]
+serde = []
+
+[package.metadata.release]
+tag = false

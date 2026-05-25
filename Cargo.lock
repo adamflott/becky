@@ -187,6 +187,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "becky-fx-rust-fn"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "becky-engine",
+ "becky-fx-id",
+ "bon",
+ "sysinfo",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "becky-fx-system-command"
 version = "0.0.1"
 dependencies = [
