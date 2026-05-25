@@ -15,7 +15,7 @@ use becky_engine::control::FxControl;
 use becky_engine::host_id::HostId;
 use becky_engine::machine_conf::FxResourceConstraints;
 use becky_engine::metadata::MetadataManager;
-use becky_engine::state::{FxExecutionState, StateCollect, StatsCollect};
+use becky_engine::state::{FxDesiredExecutionState, FxExecutionState, StateCollect, StatsCollect};
 use becky_engine::storage::SysStorage;
 use becky_engine::sys_conf::SystemConfiguration;
 use becky_engine::verify::{FxVerify, Verification};
@@ -23,8 +23,14 @@ use becky_fx_id::FxId;
 use becky_fx_system_command::FxSystemCommand;
 use qapi::qga::QgaCommand;
 use qapi::qmp::QmpCommand;
+use qemu_command_builder::args::accel::Accel;
+use qemu_command_builder::args::cpu::{CpuAarch64, CpuX86};
+use qemu_command_builder::args::name::Name;
+use qemu_command_builder::args::serial::SpecialDevice;
+use qemu_command_builder::args::smp::SMP;
 use qemu_command_builder::shell_string::ShellString;
 use qemu_command_builder::to_command::ToCommand;
+use qemu_command_builder::{QemuInstanceForAarch64, QemuInstanceForX86_64};
 use sysinfo::DiskUsage;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, error, info, trace};
@@ -54,14 +60,21 @@ pub struct QemuInstance {
 }
 
 impl Debug for QemuInstance {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QemuInstance")
+            .field("cmd", &self.cmd)
+            .field("qemu", &self.qemu)
+            .field("fx_id", &self.fx_id)
+            .field("machine_configuration", &self.machine_configuration)
+            .field("system_configuration", &self.system_configuration)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
     }
 }
 
 impl Ord for QemuInstance {
-    fn cmp(&self, _other: &Self) -> Ordering {
-        todo!()
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.fx_id.cmp(&other.fx_id)
     }
 }
 
@@ -73,19 +86,35 @@ impl PartialOrd for QemuInstance {
 
 impl Eq for QemuInstance {}
 
+// TODO - compare machine_configuration as well
 impl PartialEq for QemuInstance {
-    fn eq(&self, _other: &Self) -> bool {
-        todo!()
+    fn eq(&self, other: &Self) -> bool {
+        self.fx_id == other.fx_id
     }
 }
 
 impl QemuInstance {
     pub fn existing_or_new(
-        _system_configuration: &SystemConfiguration,
-        _machine_configuration: QemuMachineConfiguration,
-        _fx_id: &FxId,
+        system_configuration: &SystemConfiguration,
+        machine_configuration: QemuMachineConfiguration,
+        fx_id: &FxId,
     ) -> Result<Self, CreateError> {
-        todo!()
+        let qemu = qemu_from_machine_configuration(system_configuration, &machine_configuration, fx_id)?;
+        let (qapi_event_tx, qapi_event_rx) = tokio::sync::mpsc::channel(QEMU_API_EVENT_BUFFER_SIZE);
+
+        Ok(Self {
+            cmd: FxSystemCommand::new(String::new(), vec![], FxDesiredExecutionState::Running),
+            qemu,
+            fx_id: fx_id.clone(),
+            machine_configuration,
+            system_configuration: system_configuration.clone(),
+            status: qapi::qmp::StatusInfo {
+                running: false,
+                status: qapi::qmp::RunState::prelaunch,
+            },
+            qapi_event_tx,
+            qapi_event_rx,
+        })
     }
 
     pub fn ctl_socket_path(&self) -> PathBuf {
@@ -169,12 +198,10 @@ impl QemuInstance {
     }
 
     pub fn has_ga(&self) -> bool {
-        let mut enabled = false;
         match &self.machine_configuration.conf {
-            QemuMachineConfigurationByArch::Amd64(qemu) => enabled = qemu.common.enable_guest_agent,
-            QemuMachineConfigurationByArch::Aarch64(qemu) => enabled = qemu.common.enable_guest_agent,
+            QemuMachineConfigurationByArch::Amd64(qemu) => qemu.common.enable_guest_agent,
+            QemuMachineConfigurationByArch::Aarch64(qemu) => qemu.common.enable_guest_agent,
         }
-        enabled
     }
 
     pub async fn call_api<T: qapi::Command + QmpCommand + Debug>(&mut self, qemu_handle: &QemuHandle, cmd: T) -> Result<T::Ok, CallApiError> {
@@ -208,17 +235,68 @@ impl QemuInstance {
     }
 }
 
+fn parse_special_device(value: String) -> Result<SpecialDevice, CreateError> {
+    value.parse::<SpecialDevice>().map_err(CreateError::Config)
+}
+
+fn parse_name(value: &str) -> Result<Name, CreateError> {
+    value.parse::<Name>().map_err(|err| CreateError::Config(err.to_string()))
+}
+
+fn qemu_from_machine_configuration(
+    system_configuration: &SystemConfiguration,
+    machine_configuration: &QemuMachineConfiguration,
+    fx_id: &FxId,
+) -> Result<QemuSupportedArch, CreateError> {
+    match &machine_configuration.conf {
+        QemuMachineConfigurationByArch::Amd64(machine) => {
+            let mut qemu = QemuInstanceForX86_64::builder().qemu_binary(PathBuf::from("qemu-system-x86_64")).build();
+            qemu.cpu = Some(CpuX86::new(machine.cpu.clone()));
+            qemu.smp = Some(SMP::new(machine.cpus));
+            qemu.m = Some(machine.common.memory.clone());
+            qemu.accel = Some(Accel::new(machine.common.accel_type.clone()));
+            configure_common_qemu_args(system_configuration, machine_configuration, fx_id, &machine.common, &mut qemu)?;
+            Ok(QemuSupportedArch::X86_64(qemu))
+        }
+        QemuMachineConfigurationByArch::Aarch64(machine) => {
+            let mut qemu = QemuInstanceForAarch64::builder().qemu_binary(PathBuf::from("qemu-system-aarch64")).build();
+            qemu.cpu = Some(CpuAarch64 {
+                cpu_type: machine.cpu.clone(),
+            });
+            qemu.smp = Some(SMP::new(machine.cpus));
+            qemu.m = Some(machine.common.memory.clone());
+            qemu.accel = Some(Accel::new(machine.common.accel_type.clone()));
+            configure_common_qemu_args(system_configuration, machine_configuration, fx_id, &machine.common, &mut qemu)?;
+            Ok(QemuSupportedArch::Aarch64(qemu))
+        }
+    }
+}
+
+fn configure_common_qemu_args<Machine, Cpu>(
+    system_configuration: &SystemConfiguration,
+    machine_configuration: &QemuMachineConfiguration,
+    fx_id: &FxId,
+    common: &crate::QemuCommonOptions,
+    qemu: &mut qemu_command_builder::QemuInstanceBase<Machine, Cpu>,
+) -> Result<(), CreateError> {
+    qemu.name = Some(parse_name(&machine_configuration.name)?);
+    qemu.pidfile = Some(QemuInstance::pid_path_s(&system_configuration.vm_root_path, fx_id));
+    qemu.qmp = Some(parse_special_device(format!(
+        "unix:{},server=on,wait=off",
+        QemuInstance::ctl_socket_path_s(&system_configuration.vm_root_path, fx_id).display()
+    ))?);
+    qemu.kernel = common.kernel.clone();
+    qemu.initrd = common.initrd.clone();
+    qemu.snapshot = common.snapshot;
+    Ok(())
+}
+
 #[async_trait]
 impl FxControl for QemuInstance {
-    type Id = uuid::Uuid;
+    type Id = FxId;
 
     fn id(&self) -> Self::Id {
-        match self.fx_id {
-            FxId::UuidV4(u) => u,
-            _ => {
-                unreachable!()
-            }
-        }
+        self.fx_id.clone()
     }
 
     type FxAllocateResult = ();

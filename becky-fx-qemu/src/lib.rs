@@ -22,7 +22,7 @@ use qemu_command_builder::args::cpu_type::{CpuNotFound, CpuTypeAarch64, CpuTypeX
 use qemu_command_builder::args::memory::Memory;
 use qemu_command_builder::common::AccelType;
 use qemu_command_builder::to_command::ToCommand;
-use qemu_command_builder::{QemuInstanceForAarch64, QemuInstanceForX86_64};
+use qemu_command_builder::{QemuCommand, QemuInstanceForAarch64, QemuInstanceForX86_64};
 use std::env::JoinPathsError;
 use std::fmt::Debug;
 use std::num::ParseIntError;
@@ -74,11 +74,13 @@ pub enum QemuMachineConfigurationByArch {
     Aarch64(QemuMachineConfigurationAarch64),
 }
 
+#[derive(Debug)]
 pub enum QemuQcowFormat {
     Raw,
     Qcow2,
 }
 
+#[derive(Debug)]
 pub enum QemuStorageType {
     // file backed
     Qcow2(Vec<(StorageConfigurationDisk, QemuQcowFormat, QcowOptions)>),
@@ -93,6 +95,7 @@ pub enum QemuStorageType {
     CloudImage,
 }
 
+#[derive(Debug)]
 pub struct QemuMachineConfiguration {
     pub name: String,
     pub system_configuration: SystemConfiguration,
@@ -331,6 +334,13 @@ pub enum QemuSupportedArch {
 }
 
 impl ToCommand for QemuSupportedArch {
+    fn command(&self) -> String {
+        match self {
+            QemuSupportedArch::X86_64(qemu_instance) => qemu_instance.command(),
+            QemuSupportedArch::Aarch64(qemu_instance) => qemu_instance.command(),
+        }
+    }
+
     fn to_args(&self) -> Vec<String> {
         match self {
             QemuSupportedArch::X86_64(qemu_instance) => qemu_instance.to_args(),
@@ -340,10 +350,13 @@ impl ToCommand for QemuSupportedArch {
 }
 
 impl FromStr for QemuSupportedArch {
-    type Err = ();
+    type Err = String;
 
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        todo!()
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<QemuCommand>()? {
+            QemuCommand::X86_64(qemu) => Ok(QemuSupportedArch::X86_64(qemu)),
+            QemuCommand::Aarch64(qemu) => Ok(QemuSupportedArch::Aarch64(qemu)),
+        }
     }
 }
 #[derive(Clone, Debug)]
@@ -386,6 +399,9 @@ pub enum WorkerCommand {
 
 #[derive(Error, Debug)]
 pub enum CreateError {
+    #[error("config: {0}")]
+    Config(String),
+
     #[error("todo {0}")]
     GetProc(String),
 
