@@ -1,6 +1,6 @@
 # Becky
 
-A Rust framework for building compute (QEMU, commands, Rust, etc) orchestrators.
+A Rust framework for building compute (QEMU, Docker, commands, Rust, etc) orchestrators.
 
 This is an R&D project, and my current passion project.
 
