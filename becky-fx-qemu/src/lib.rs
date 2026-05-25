@@ -14,7 +14,7 @@ use becky_engine::empy_implementations::Metadataless;
 use becky_engine::host_id::HostId;
 use becky_engine::machine_conf::{BootStrapMethod, FxResourceConstraints, NetworkingConfiguration, StorageConfigurationDisk, StorageConfigurationIso};
 use becky_engine::metadata::MetadataManager;
-use becky_engine::storage::{StorageResizeRequest, SysStorage};
+use becky_engine::storage::{StorageResizeRequest, StorageResizeRequestDirection, SysStorage};
 use becky_engine::sys_conf::SystemConfiguration;
 use becky_fx_id::FxId;
 use becky_fx_system_command::FxSysCommandError;
@@ -104,6 +104,56 @@ pub struct QemuMachineConfiguration {
     pub conf: QemuMachineConfigurationByArch,
     pub storage: Vec<QemuStorageType>,
     pub networking: Option<NetworkingConfiguration>,
+}
+
+fn vm_data_dir(system_configuration: &SystemConfiguration, fx_id: &FxId) -> PathBuf {
+    let mut path = system_configuration.vm_data_root_path.clone();
+    path.push(fx_id.to_string());
+    path
+}
+
+fn sanitize_storage_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect()
+}
+
+fn disk_stem(props: &StorageConfigurationDisk) -> String {
+    if !props.id.is_empty() {
+        sanitize_storage_name(&props.id)
+    } else {
+        props
+            .path
+            .file_name()
+            .map(|name| sanitize_storage_name(&name.to_string_lossy()))
+            .unwrap_or_else(|| "disk".to_string())
+    }
+}
+
+fn qemu_disk_path(system_configuration: &SystemConfiguration, fx_id: &FxId, props: &StorageConfigurationDisk, format: &QemuQcowFormat) -> PathBuf {
+    let ext = match format {
+        QemuQcowFormat::Raw => QEMU_IMG_FILE_EXIT_RAW,
+        QemuQcowFormat::Qcow2 => QEMU_IMG_FILE_EXT_QCOW2,
+    };
+
+    let mut filename = vm_data_dir(system_configuration, fx_id);
+    filename.push(format!("{}.{}", disk_stem(props), ext));
+    filename
+}
+
+fn iso_dest_path(system_configuration: &SystemConfiguration, fx_id: &FxId, iso: &StorageConfigurationIso) -> PathBuf {
+    let name = if !iso.id.is_empty() {
+        sanitize_storage_name(&iso.id)
+    } else {
+        iso.path
+            .file_name()
+            .map(|name| sanitize_storage_name(&name.to_string_lossy()))
+            .unwrap_or_else(|| "media.iso".to_string())
+    };
+
+    let mut dest = vm_data_dir(system_configuration, fx_id);
+    dest.push(name);
+    dest
 }
 
 /// QEMU-specific resource request accepted by [`manager::QemuManager`].
@@ -221,16 +271,7 @@ impl SysStorage for QemuMachineConfiguration {
             match storage {
                 QemuStorageType::Qcow2(files) => {
                     for (props, format, _opts) in files {
-                        let mut filename = PathBuf::new();
-                        filename.push(self.system_configuration.vm_data_root_path.clone());
-                        filename.push(fx_id.to_string());
-
-                        let ext = match format {
-                            QemuQcowFormat::Raw => QEMU_IMG_FILE_EXIT_RAW,
-                            QemuQcowFormat::Qcow2 => QEMU_IMG_FILE_EXT_QCOW2,
-                        };
-
-                        filename.push(format!("{}.{}", props.path.display(), ext));
+                        let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
 
                         match run_system_command(
                             QEMU_BIN_IMG,
@@ -254,7 +295,7 @@ impl SysStorage for QemuMachineConfiguration {
                     }
                 }
                 QemuStorageType::HostBlock => {
-                    todo!()
+                    errors.push(QemuStorageCreateError::UnsupportedStorage("host block storage is not implemented"));
                 }
                 QemuStorageType::Iso(isos) => {
                     for iso in isos {
@@ -272,7 +313,7 @@ impl SysStorage for QemuMachineConfiguration {
                     }
                 }
                 QemuStorageType::CloudImage => {
-                    todo!()
+                    errors.push(QemuStorageCreateError::UnsupportedStorage("cloud image storage is not implemented"));
                 }
             }
         }
@@ -280,16 +321,16 @@ impl SysStorage for QemuMachineConfiguration {
     }
 
     type SysStorageCheckResult = ();
-    type SysStorageCheckError = ();
+    type SysStorageCheckError = Vec<QemuStorageCreateError>;
 
     async fn sys_storage_check<T: MetadataManager + Send + Sync>(
         &mut self,
-        _host_id: &HostId,
-        _mdm: &mut T,
-        _fx_id: &FxId,
-        _rc: impl FxResourceConstraints,
+        host_id: &HostId,
+        mdm: &mut T,
+        fx_id: &FxId,
+        rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageCheckResult, Self::SysStorageCheckError> {
-        todo!()
+        self.sys_storage_info(host_id, mdm, fx_id, rc).await
     }
 
     type SysStorageCreateResult = ();
@@ -308,37 +349,32 @@ impl SysStorage for QemuMachineConfiguration {
             match storage {
                 QemuStorageType::Qcow2(files) => {
                     for (props, format, _opts) in files {
-                        let mut filename = PathBuf::new();
-                        filename.push(self.system_configuration.vm_data_root_path.clone());
-                        filename.push(fx_id.to_string());
+                        let data_dir = vm_data_dir(&self.system_configuration, fx_id);
 
-                        if let Err(err) = tokio::fs::create_dir_all(&filename).await {
+                        if let Err(err) = tokio::fs::create_dir_all(&data_dir).await {
                             errors.push(QemuStorageCreateError::IO(err));
                             continue;
                         }
 
-                        let (fmt, ext) = match format {
-                            QemuQcowFormat::Raw => (QEMU_IMG_FORMAT_RAW, QEMU_IMG_FILE_EXIT_RAW),
-                            QemuQcowFormat::Qcow2 => (QEMU_IMG_FORMAT_QCOW2, QEMU_IMG_FILE_EXT_QCOW2),
+                        let fmt = match format {
+                            QemuQcowFormat::Raw => QEMU_IMG_FORMAT_RAW,
+                            QemuQcowFormat::Qcow2 => QEMU_IMG_FORMAT_QCOW2,
                         };
 
-                        filename.push(format!("{}.{}", props.path.display(), ext));
+                        let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
 
-                        if let Ok(found) = tokio::fs::try_exists(&filename).await {
-                            if found {
+                        match tokio::fs::try_exists(&filename).await {
+                            Ok(true) => {
                                 if let Err(corrupt_err) = is_qcow_image_corrupt(&filename).await {
                                     errors.push(corrupt_err);
                                 }
-                            } else {
+                            }
+                            Ok(false) => {
+                                let filename_arg = filename.display().to_string();
+                                let size_arg = props.size.as_u64().to_string();
                                 match run_system_command(
                                     QEMU_BIN_IMG,
-                                    vec![
-                                        "create",
-                                        "--format",
-                                        fmt,
-                                        filename.display().to_string().as_str(),
-                                        props.size.as_u64().to_string().as_str(),
-                                    ],
+                                    vec!["create", "--format", fmt, filename_arg.as_str(), size_arg.as_str()],
                                     CommandOptions::default(),
                                 )
                                 .await
@@ -349,24 +385,23 @@ impl SysStorage for QemuMachineConfiguration {
                                     }
                                 }
                             }
+                            Err(err) => errors.push(QemuStorageCreateError::IO(err)),
                         }
                     }
                 }
                 QemuStorageType::HostBlock => {
-                    todo!()
+                    errors.push(QemuStorageCreateError::UnsupportedStorage("host block storage is not implemented"));
                 }
                 QemuStorageType::Iso(isos) => {
                     for iso in isos {
-                        // TODO find a way to sync just this vm's cloud image
-                        // let _ = mdm.sync_images(&self.system_configuration.os_cache_root_path).await;
+                        let data_dir = vm_data_dir(&self.system_configuration, fx_id);
+                        if let Err(err) = tokio::fs::create_dir_all(&data_dir).await {
+                            errors.push(QemuStorageCreateError::IO(err));
+                            continue;
+                        }
 
-                        let src_filename = self.system_configuration.os_cache_root_path.clone();
-                        // src_filename.push(mdm.get_filename(&img.os));
-
-                        let mut dest_filename = self.system_configuration.vm_data_root_path.clone();
-                        dest_filename.push(fx_id.to_string());
-                        // TODO device dest filename extension from vm new request
-                        dest_filename.push(format!("{}.qcow2", iso.path.clone().display()).as_str());
+                        let src_filename = iso.path.clone();
+                        let dest_filename = iso_dest_path(&self.system_configuration, fx_id, iso);
 
                         info!("cp {} -> {}", &src_filename.display(), dest_filename.display());
 
@@ -376,12 +411,13 @@ impl SysStorage for QemuMachineConfiguration {
                             }
                             Err(copy_err) => {
                                 error!("copy failed: {}", copy_err);
+                                errors.push(QemuStorageCreateError::IO(copy_err));
                             }
                         }
                     }
                 }
                 QemuStorageType::CloudImage => {
-                    todo!()
+                    errors.push(QemuStorageCreateError::UnsupportedStorage("cloud image storage is not implemented"));
                 }
             }
         }
@@ -398,7 +434,7 @@ impl SysStorage for QemuMachineConfiguration {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageOpenResult, Self::SysStorageOpenError> {
-        todo!()
+        Ok(())
     }
 
     type SysStorageCloseResult = ();
@@ -411,21 +447,55 @@ impl SysStorage for QemuMachineConfiguration {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageCloseResult, Self::SysStorageCloseError> {
-        todo!()
+        Ok(())
     }
 
     type SysStorageResizeResult = ();
-    type SysStorageResizeError = ();
+    type SysStorageResizeError = Vec<QemuStorageCreateError>;
 
     async fn sys_storage_resize<T: MetadataManager + Send + Sync>(
         &mut self,
         _host_id: &HostId,
         _mdm: &mut T,
-        _fx_id: &FxId,
+        fx_id: &FxId,
         _rc: impl FxResourceConstraints,
-        _resize_requests: Vec<StorageResizeRequest>,
+        resize_requests: Vec<StorageResizeRequest>,
     ) -> Result<Self::SysStorageResizeResult, Self::SysStorageResizeError> {
-        todo!()
+        let mut errors = vec![];
+
+        for request in resize_requests {
+            let mut found = false;
+            for storage in &self.storage {
+                if let QemuStorageType::Qcow2(files) = storage {
+                    for (props, format, _opts) in files {
+                        if props.id != request.filepath.id {
+                            continue;
+                        }
+
+                        found = true;
+                        let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
+                        let filename_arg = filename.display().to_string();
+                        let size_arg = request.new_size.as_u64().to_string();
+                        let mut args = vec!["resize"];
+                        if matches!(request.dir, StorageResizeRequestDirection::Shrink) {
+                            args.push("--shrink");
+                        }
+                        args.push(filename_arg.as_str());
+                        args.push(size_arg.as_str());
+
+                        if let Err(err) = run_system_command(QEMU_BIN_IMG, args, CommandOptions::default()).await {
+                            errors.push(QemuStorageCreateError::CommandRanError(err));
+                        }
+                    }
+                }
+            }
+
+            if !found {
+                errors.push(QemuStorageCreateError::FileNotFound(request.filepath.path.clone()));
+            }
+        }
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 }
 
@@ -600,6 +670,9 @@ pub enum QemuStorageCreateError {
 
     #[error("file not found: {0}")]
     FileNotFound(PathBuf),
+
+    #[error("unsupported storage: {0}")]
+    UnsupportedStorage(&'static str),
 }
 
 #[derive(Error, Debug)]
