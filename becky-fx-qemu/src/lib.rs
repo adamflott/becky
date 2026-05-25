@@ -10,6 +10,7 @@ use crate::img_json::QemuImgInfo;
 use crate::storage_qcow::{QEMU_IMG_FILE_EXIT_RAW, QEMU_IMG_FILE_EXT_QCOW2, QEMU_IMG_FORMAT_QCOW2, QEMU_IMG_FORMAT_RAW, QcowOptions, is_qcow_image_corrupt};
 use async_trait::async_trait;
 use becky_engine::boot_methods::BootMethod;
+use becky_engine::empy_implementations::Metadataless;
 use becky_engine::host_id::HostId;
 use becky_engine::machine_conf::{BootStrapMethod, FxResourceConstraints, NetworkingConfiguration, StorageConfigurationDisk, StorageConfigurationIso};
 use becky_engine::metadata::MetadataManager;
@@ -19,7 +20,7 @@ use becky_fx_id::FxId;
 use becky_utils::{CommandOptions, CommandRanError, run_system_command};
 use bon::Builder;
 use qemu_command_builder::args::cpu_type::{CpuNotFound, CpuTypeAarch64, CpuTypeX86_64};
-use qemu_command_builder::args::memory::Memory;
+use qemu_command_builder::args::memory::{Memory, MemoryUnit};
 use qemu_command_builder::common::AccelType;
 use qemu_command_builder::to_command::ToCommand;
 use qemu_command_builder::{QemuCommand, QemuInstanceForAarch64, QemuInstanceForX86_64};
@@ -74,13 +75,13 @@ pub enum QemuMachineConfigurationByArch {
     Aarch64(QemuMachineConfigurationAarch64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QemuQcowFormat {
     Raw,
     Qcow2,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QemuStorageType {
     // file backed
     Qcow2(Vec<(StorageConfigurationDisk, QemuQcowFormat, QcowOptions)>),
@@ -95,13 +96,111 @@ pub enum QemuStorageType {
     CloudImage,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QemuMachineConfiguration {
     pub name: String,
     pub system_configuration: SystemConfiguration,
     pub conf: QemuMachineConfigurationByArch,
     pub storage: Vec<QemuStorageType>,
     pub networking: Option<NetworkingConfiguration>,
+}
+
+/// QEMU-specific resource request accepted by [`manager::QemuManager`].
+///
+/// This type carries the full VM shape that the generic Becky
+/// [`FxResourceConstraints`] trait cannot currently express directly.
+#[derive(Builder, Debug, Clone)]
+pub struct QemuMachineRequest {
+    pub name: String,
+    pub conf: QemuMachineConfigurationByArch,
+    pub storage: Vec<QemuStorageType>,
+    pub networking: Option<NetworkingConfiguration>,
+}
+
+impl QemuMachineRequest {
+    pub fn default_for_host() -> Self {
+        Self {
+            name: "becky-qemu".to_string(),
+            conf: default_machine_configuration_by_host(default_common_options()),
+            storage: vec![],
+            networking: Some(NetworkingConfiguration::User),
+        }
+    }
+
+    pub fn to_machine_configuration(&self, system_configuration: &SystemConfiguration) -> QemuMachineConfiguration {
+        QemuMachineConfiguration {
+            name: self.name.clone(),
+            system_configuration: system_configuration.clone(),
+            conf: self.conf.clone(),
+            storage: self.storage.clone(),
+            networking: self.networking.clone(),
+        }
+    }
+}
+
+impl Default for QemuMachineRequest {
+    fn default() -> Self {
+        Self::default_for_host()
+    }
+}
+
+impl FxResourceConstraints for QemuMachineRequest {
+    type Metadata = Metadataless;
+    type FxStorageConfiguration = Vec<QemuStorageType>;
+    type FxConfiguration = QemuMachineRequest;
+
+    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()> {
+        Ok(self.clone())
+    }
+
+    fn storage_configurations(&self) -> Self::FxStorageConfiguration {
+        self.storage.clone()
+    }
+}
+
+/// Resource constraints that can be converted into concrete QEMU machine
+/// configuration by a QEMU manager.
+pub trait QemuFxResourceConstraints: FxResourceConstraints {
+    fn qemu_machine_configuration(&self, system_configuration: &SystemConfiguration) -> QemuMachineConfiguration;
+}
+
+impl QemuFxResourceConstraints for QemuMachineRequest {
+    fn qemu_machine_configuration(&self, system_configuration: &SystemConfiguration) -> QemuMachineConfiguration {
+        self.to_machine_configuration(system_configuration)
+    }
+}
+
+pub fn default_common_options() -> QemuCommonOptions {
+    QemuCommonOptions {
+        memory: Memory::builder().mem(MemoryUnit::MegaBytes(512)).build(),
+        enable_guest_agent: false,
+        kernel: None,
+        initrd: None,
+        extra_options: vec![],
+        snapshot: None,
+        boot_kernel: false,
+        accel_type: AccelType::Tcg,
+        bootstrap_method: BootStrapMethod::None,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn default_machine_configuration_by_host(common: QemuCommonOptions) -> QemuMachineConfigurationByArch {
+    QemuMachineConfigurationByArch::Aarch64(QemuMachineConfigurationAarch64 {
+        common,
+        cpu: CpuTypeAarch64::Max,
+        cpus: 1,
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn default_machine_configuration_by_host(common: QemuCommonOptions) -> QemuMachineConfigurationByArch {
+    QemuMachineConfigurationByArch::Amd64(QemuMachineConfigurationAmd64 {
+        common,
+        cpu: CpuTypeX86_64::Max,
+        cpus: 1,
+        boot_method: BootMethod::Bios,
+    })
 }
 
 #[async_trait]

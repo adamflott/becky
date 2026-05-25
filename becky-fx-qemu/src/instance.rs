@@ -260,9 +260,7 @@ fn qemu_from_machine_configuration(
         }
         QemuMachineConfigurationByArch::Aarch64(machine) => {
             let mut qemu = QemuInstanceForAarch64::builder().qemu_binary(PathBuf::from("qemu-system-aarch64")).build();
-            qemu.cpu = Some(CpuAarch64 {
-                cpu_type: machine.cpu.clone(),
-            });
+            qemu.cpu = Some(CpuAarch64 { cpu_type: machine.cpu.clone() });
             qemu.smp = Some(SMP::new(machine.cpus));
             qemu.m = Some(machine.common.memory.clone());
             qemu.accel = Some(Accel::new(machine.common.accel_type.clone()));

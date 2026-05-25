@@ -1,6 +1,5 @@
 use becky_engine::control::FxControl;
 use becky_engine::host_id::HostId;
-use becky_engine::machine_conf::FxResourceConstraints;
 use becky_engine::metadata::MetadataManager;
 use becky_engine::storage::SysStorage;
 use becky_engine::sys_conf::SystemConfiguration;
@@ -9,7 +8,7 @@ use becky_fx_id::FxId;
 
 use crate::handle::QemuHandle;
 use crate::instance::QemuInstance;
-use crate::{CreateError, GuestAgentCmd, QemuMachineConfiguration, QmpCmd, WorkerCommand, WorkerEvent};
+use crate::{CreateError, GuestAgentCmd, QemuFxResourceConstraints, QemuMachineConfiguration, QmpCmd, WorkerCommand, WorkerEvent};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +26,8 @@ pub struct QemuRunningInstance {
     pub(crate) qemu: QemuInstance,
 }
 
-fn convert(_rc: &impl FxResourceConstraints) -> QemuMachineConfiguration {
-    todo!()
+fn convert(system_configuration: &SystemConfiguration, rc: &impl QemuFxResourceConstraints) -> QemuMachineConfiguration {
+    rc.qemu_machine_configuration(system_configuration)
 }
 
 /// Manager for running QEMU instance(s). Used to control their behavior and get status updates
@@ -56,7 +55,7 @@ impl QemuManager {
         &mut self,
         host_id: &HostId,
         mdt: &mut T,
-        rc: &impl FxResourceConstraints,
+        rc: &impl QemuFxResourceConstraints,
         storage: &mut impl SysStorage,
     ) -> Vec<JoinHandle<()>> {
         let mut join_handles = Vec::new();
@@ -101,10 +100,10 @@ impl QemuManager {
         host_id: &HostId,
         mdt: &mut T,
         storage: &mut impl SysStorage,
-        rc: &impl FxResourceConstraints,
+        rc: &impl QemuFxResourceConstraints,
         fx_id: FxId,
     ) -> Result<(), CreateError> {
-        let q = convert(rc);
+        let q = convert(&self.system_configuration, rc);
         let mut qemu = QemuInstance::existing_or_new(&self.system_configuration, q, &fx_id)?;
 
         match qemu.fx_allocate(host_id, &fx_id, mdt, rc, storage).await {
@@ -124,10 +123,10 @@ impl QemuManager {
         host_id: &HostId,
         mdt: &mut T,
         storage: &mut impl SysStorage,
-        rc: impl FxResourceConstraints,
+        rc: impl QemuFxResourceConstraints,
         fx_id: FxId,
     ) -> Result<JoinHandle<()>, CreateError> {
-        let q = convert(&rc);
+        let q = convert(&self.system_configuration, &rc);
         let mut qemu = QemuInstance::existing_or_new(
             // TODO should be existing otherwise failure
             &self.system_configuration,
