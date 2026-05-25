@@ -31,7 +31,7 @@ use qemu_command_builder::args::smp::SMP;
 use qemu_command_builder::shell_string::ShellString;
 use qemu_command_builder::to_command::ToCommand;
 use qemu_command_builder::{QemuInstanceForAarch64, QemuInstanceForX86_64};
-use sysinfo::DiskUsage;
+use sysinfo::{DiskUsage, Pid, System};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, error, info, trace};
 
@@ -232,6 +232,43 @@ impl QemuInstance {
                 }
             }
         }
+    }
+}
+
+fn state_from_qmp_status(status: &qapi::qmp::StatusInfo, pid: u32) -> FxExecutionState {
+    match status.status {
+        qapi::qmp::RunState::running => FxExecutionState::Running(pid),
+        qapi::qmp::RunState::paused
+        | qapi::qmp::RunState::debug
+        | qapi::qmp::RunState::inmigrate
+        | qapi::qmp::RunState::postmigrate
+        | qapi::qmp::RunState::finish_migrate
+        | qapi::qmp::RunState::restore_vm
+        | qapi::qmp::RunState::save_vm
+        | qapi::qmp::RunState::suspended
+        | qapi::qmp::RunState::colo => FxExecutionState::Paused(pid),
+        qapi::qmp::RunState::prelaunch => FxExecutionState::NotStarted,
+        qapi::qmp::RunState::shutdown => FxExecutionState::Stopped,
+        qapi::qmp::RunState::internal_error | qapi::qmp::RunState::io_error | qapi::qmp::RunState::watchdog | qapi::qmp::RunState::guest_panicked => {
+            FxExecutionState::Error(format!("{:?}", status.status))
+        }
+    }
+}
+
+fn process_metric<T>(pid: u32, fallback: T, f: impl FnOnce(&sysinfo::Process) -> T) -> T {
+    let system = System::new_all();
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => f(process),
+        None => fallback,
+    }
+}
+
+fn empty_disk_usage() -> DiskUsage {
+    DiskUsage {
+        total_written_bytes: 0,
+        written_bytes: 0,
+        total_read_bytes: 0,
+        read_bytes: 0,
     }
 }
 
@@ -445,68 +482,79 @@ impl FxControl for QemuInstance {
     }
 
     type FxDestroyResult = ();
-    type FxDestroyError = ();
+    type FxDestroyError = CallApiError;
 
-    async fn fx_destroy(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
-        todo!()
+    async fn fx_destroy(&self, fnr: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
+        fnr.ctl.execute(qapi::qmp::quit {}).await?;
+        Ok(())
     }
 
     type FxArchiveResult = ();
     type FxArchiveError = ();
 
     async fn fx_archive(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxArchiveResult, Self::FxArchiveError> {
-        todo!()
+        Ok(())
     }
 }
 #[async_trait]
 impl FxVerify for QemuInstance {
     type FxOpVerifyError = VerifyError;
 
-    async fn fx_op_verify(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Verification, Self::FxOpVerifyError> {
-        todo!()
+    async fn fx_op_verify(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Verification, Self::FxOpVerifyError> {
+        if System::new_all().process(Pid::from_u32(handle.process.pid)).is_none() {
+            return Ok(Verification::Unknown);
+        }
+
+        let status = self.call_api(handle, qapi::qmp::query_status {}).await?;
+        self.status = status;
+        Ok(Verification::Match)
     }
 }
 
 #[async_trait]
 impl StatsCollect for QemuInstance {
     type FxStatCollectResult = ();
-    type FxStatCollectError = ();
+    type FxStatCollectError = CallApiError;
 
-    async fn stat_collect(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatCollectResult, Self::FxStatCollectError> {
-        todo!()
+    async fn stat_collect(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatCollectResult, Self::FxStatCollectError> {
+        let _ = self.call_api(handle, qapi::qmp::query_block {}).await?;
+        Ok(())
     }
 }
 
 #[async_trait]
 impl StateCollect for QemuInstance {
-    type FxStateCollectResult = ();
-    type FxStateCollectError = ();
+    type FxStateCollectResult = FxExecutionState;
+    type FxStateCollectError = CallApiError;
 
-    async fn state_collect(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Self::FxStateCollectResult, Self::FxStateCollectError> {
-        todo!()
+    async fn state_collect(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStateCollectResult, Self::FxStateCollectError> {
+        let status = self.call_api(handle, qapi::qmp::query_status {}).await?;
+        let state = state_from_qmp_status(&status, handle.process.pid);
+        self.status = status;
+        Ok(state)
     }
 }
 #[async_trait]
 impl FxAccounting for QemuInstance {
-    type Instance = ();
+    type Instance = QemuHandle;
 
-    async fn accumulated_cpu_time(&self, _i: &Self::Instance) -> u64 {
-        todo!()
+    async fn accumulated_cpu_time(&self, i: &Self::Instance) -> u64 {
+        process_metric(i.process.pid, 0, |process| process.accumulated_cpu_time())
     }
 
-    async fn disk_usage(&self, _i: &Self::Instance) -> DiskUsage {
-        todo!()
+    async fn disk_usage(&self, i: &Self::Instance) -> DiskUsage {
+        process_metric(i.process.pid, empty_disk_usage(), |process| process.disk_usage())
     }
 
-    async fn memory(&self, _i: &Self::Instance) -> u64 {
-        todo!()
+    async fn memory(&self, i: &Self::Instance) -> u64 {
+        process_metric(i.process.pid, 0, |process| process.memory())
     }
 
-    async fn virtual_memory(&self, _i: &Self::Instance) -> u64 {
-        todo!()
+    async fn virtual_memory(&self, i: &Self::Instance) -> u64 {
+        process_metric(i.process.pid, 0, |process| process.virtual_memory())
     }
 
-    async fn run_time(&self, _i: &Self::Instance) -> u64 {
-        todo!()
+    async fn run_time(&self, i: &Self::Instance) -> u64 {
+        process_metric(i.process.pid, 0, |process| process.run_time())
     }
 }
