@@ -65,7 +65,14 @@ impl QemuManager {
 
             let vm_event_tx = self.sender.clone();
             let guest_agent_enabled = vm.read().await.qemu.has_ga();
-            match vm.write().await.qemu.fx_start(host_id, &uuid.clone(), mdt, rc, storage).await {
+            let maybe_attached = vm.write().await.qemu.try_attach_existing(host_id, uuid, mdt).await;
+            let handle_result = match maybe_attached {
+                Ok(Some(handle)) => Ok(handle),
+                Ok(None) => vm.write().await.qemu.fx_start(host_id, uuid, mdt, rc, storage).await,
+                Err(err) => Err(err),
+            };
+
+            match handle_result {
                 Ok(handle) => {
                     let handle = tokio::spawn(worker_process(
                         uuid.clone(),

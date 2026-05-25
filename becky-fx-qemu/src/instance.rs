@@ -33,7 +33,7 @@ use qemu_command_builder::to_command::ToCommand;
 use qemu_command_builder::{QemuInstanceForAarch64, QemuInstanceForX86_64};
 use sysinfo::{DiskUsage, Pid, System};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 pub const QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS: u64 = 100;
 pub const QEMU_WAIT_UDS_TIMEOUT_SECS: u64 = 3;
@@ -248,6 +248,44 @@ impl QemuInstance {
             }
         }
     }
+
+    pub async fn try_attach_existing<T: MetadataManager>(&mut self, host_id: &HostId, fx_id: &FxId, mdt: &mut T) -> Result<Option<QemuHandle>, SpawnError> {
+        let pidfile = QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id);
+        let Some(pid) = live_pid_from_pidfile(&pidfile) else {
+            reconcile_existing_files(&self.system_configuration, &self.fx_id);
+            return Ok(None);
+        };
+
+        if !self.ctl_socket_path().exists() {
+            warn!(
+                "qemu:attach pidfile is live but qmp socket is missing pid:{} path:{}",
+                pid,
+                self.ctl_socket_path().display()
+            );
+            return Ok(None);
+        }
+
+        match try_connect_ctl_socket(&self.ctl_socket_path()).await {
+            Ok((api, events)) => {
+                let qapi_event_tx = self.qapi_event_tx.clone();
+                let mut handle = try_monitor_qemu_with_api(api, events, qapi_event_tx, pidfile).await?;
+                mdt.metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(handle.process.pid))
+                    .await
+                    .map_err(|_| SpawnError::Db)?;
+
+                if self.has_ga() {
+                    let (qga, _qga_handle) = try_connect_ga_socket(&self.ga_socket_path()).await.map_err(SpawnError::Timeout)?;
+                    handle.ga = Some(qga);
+                }
+
+                Ok(Some(handle))
+            }
+            Err(timeout_err) => {
+                debug!("qemu:attach qmp connection timed out pid:{} error:{:?}", pid, timeout_err);
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn command_from_qemu(qemu: &QemuSupportedArch) -> FxSystemCommand {
@@ -267,9 +305,17 @@ fn reconcile_existing_files(system_configuration: &SystemConfiguration, fx_id: &
         return;
     }
 
-    let _ = std::fs::remove_file(pidfile);
-    let _ = std::fs::remove_file(QemuInstance::ctl_socket_path_s(&system_configuration.vm_root_path, fx_id));
-    let _ = std::fs::remove_file(QemuInstance::ga_socket_path_s(&system_configuration.vm_root_path, fx_id));
+    remove_stale_file(&pidfile);
+    remove_stale_file(&QemuInstance::ctl_socket_path_s(&system_configuration.vm_root_path, fx_id));
+    remove_stale_file(&QemuInstance::ga_socket_path_s(&system_configuration.vm_root_path, fx_id));
+}
+
+fn remove_stale_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => debug!("qemu:reconcile removed stale file:{}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => warn!("qemu:reconcile failed to remove stale file:{} error:{}", path.display(), err),
+    }
 }
 
 fn state_from_qmp_status(status: &qapi::qmp::StatusInfo, pid: u32) -> FxExecutionState {
@@ -418,27 +464,8 @@ impl FxControl for QemuInstance {
         rc: &impl FxResourceConstraints,
         storage: &mut impl SysStorage,
     ) -> Result<Self::FxSpawnResult, Self::FxSpawnError> {
-        if live_pid_from_pidfile(&QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id)).is_some() && self.ctl_socket_path().exists() {
-            match try_connect_ctl_socket(&self.ctl_socket_path()).await {
-                Ok((api, events)) => {
-                    let pidfile = QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id);
-                    let qapi_event_tx = self.qapi_event_tx.clone();
-                    let mut handle = try_monitor_qemu_with_api(api, events, qapi_event_tx, pidfile).await?;
-                    mdt.metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(handle.process.pid))
-                        .await
-                        .map_err(|_| SpawnError::Db)?;
-
-                    if self.has_ga() {
-                        let (qga, _qga_handle) = try_connect_ga_socket(&self.ga_socket_path()).await.map_err(SpawnError::Timeout)?;
-                        handle.ga = Some(qga);
-                    }
-
-                    return Ok(handle);
-                }
-                Err(timeout_err) => {
-                    debug!("qemu:reattach timed out, attempting fresh start:{:?}", timeout_err);
-                }
-            }
+        if let Some(handle) = self.try_attach_existing(host_id, fx_id, mdt).await? {
+            return Ok(handle);
         }
 
         let root_path = PathBuf::from(&self.system_configuration.vm_root_path);
