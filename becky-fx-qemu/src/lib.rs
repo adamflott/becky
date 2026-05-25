@@ -312,7 +312,10 @@ impl SysStorage for QemuMachineConfiguration {
                         filename.push(self.system_configuration.vm_data_root_path.clone());
                         filename.push(fx_id.to_string());
 
-                        let _ = tokio::fs::create_dir_all(&filename).await;
+                        if let Err(err) = tokio::fs::create_dir_all(&filename).await {
+                            errors.push(QemuStorageCreateError::IO(err));
+                            continue;
+                        }
 
                         let (fmt, ext) = match format {
                             QemuQcowFormat::Raw => (QEMU_IMG_FORMAT_RAW, QEMU_IMG_FILE_EXIT_RAW),

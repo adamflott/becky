@@ -429,17 +429,17 @@ impl FxControl for QemuInstance {
     ) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
         let mut root_path = PathBuf::from(&self.system_configuration.vm_root_path);
         root_path.push(self.fx_id.to_string());
-        let _ = tokio::fs::create_dir_all(&root_path).await;
+        tokio::fs::create_dir_all(&root_path).await?;
         for dir in ["log", "run"] {
             let mut new_path = root_path.clone();
             new_path.push(dir);
             trace!("qemu:spawn creating dir:{}", &new_path.display());
-            let _ = tokio::fs::create_dir(&new_path).await;
+            tokio::fs::create_dir_all(&new_path).await?;
         }
 
         let mut data_root_path = PathBuf::from(&self.system_configuration.vm_data_root_path);
         data_root_path.push(self.fx_id.to_string());
-        let _ = tokio::fs::create_dir_all(&data_root_path).await;
+        tokio::fs::create_dir_all(&data_root_path).await?;
 
         match storage.sys_storage_create(&self.system_configuration, host_id, mdt, fx_id, rc).await {
             Ok(result) => {
