@@ -74,6 +74,7 @@ impl QemuManager {
 
             match handle_result {
                 Ok(handle) => {
+                    vm.write().await.pid = handle.process.pid;
                     let handle = tokio::spawn(worker_process(
                         uuid.clone(),
                         vm_event_tx,
@@ -150,7 +151,8 @@ impl QemuManager {
 
                     let worker_event_tx = self.sender.clone();
                     let guest_agent_enabled = qemu.has_ga();
-                    let running_qemu_instance = Arc::new(RwLock::new(QemuRunningInstance { pid: 0, qemu }));
+                    let pid = handle.process.pid;
+                    let running_qemu_instance = Arc::new(RwLock::new(QemuRunningInstance { pid, qemu }));
                     let spawn_handle = tokio::spawn(worker_process(
                         fx_id.clone(),
                         worker_event_tx,
