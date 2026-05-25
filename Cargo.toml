@@ -4,6 +4,7 @@ members = [
     "becky-engine",
     "becky-fx-docker",
     "becky-fx-id",
+    "becky-fx-qemu",
     "becky-fx-rust-fn",
     "becky-fx-system-command",
     "becky-utils"

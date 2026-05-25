@@ -1,0 +1,436 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
+use std::path::{Path, PathBuf};
+
+use crate::comm::{try_connect_ctl_socket, try_connect_ga_socket, try_monitor_qemu_with_api};
+use crate::handle::QemuHandle;
+use crate::{
+    AllocateError, CallApiError, CreateError, QEMU_PID_FILENAME, QemuMachineConfiguration, QemuMachineConfigurationByArch, QemuSupportedArch, SpawnError,
+    VerifyError,
+};
+use async_trait::async_trait;
+use becky_engine::FxAccounting;
+use becky_engine::control::FxControl;
+use becky_engine::host_id::HostId;
+use becky_engine::machine_conf::FxResourceConstraints;
+use becky_engine::metadata::MetadataManager;
+use becky_engine::state::{FxExecutionState, StateCollect, StatsCollect};
+use becky_engine::storage::SysStorage;
+use becky_engine::sys_conf::SystemConfiguration;
+use becky_engine::verify::{FxVerify, Verification};
+use becky_fx_id::FxId;
+use becky_fx_system_command::FxSystemCommand;
+use qapi::qga::QgaCommand;
+use qapi::qmp::QmpCommand;
+use qemu_command_builder::shell_string::ShellString;
+use qemu_command_builder::to_command::ToCommand;
+use sysinfo::DiskUsage;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::{debug, error, info, trace};
+
+pub const QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS: u64 = 100;
+pub const QEMU_WAIT_UDS_TIMEOUT_SECS: u64 = 3;
+pub const QEMU_API_EVENT_BUFFER_SIZE: usize = 100;
+
+fn vec_to_btreemap_shell_string(vs: Vec<(std::string::String, std::string::String)>) -> BTreeMap<ShellString, ShellString> {
+    let mut btreemap = BTreeMap::new();
+    for (k, v) in vs {
+        btreemap.insert(ShellString::new(k), ShellString::new(v));
+    }
+    btreemap
+}
+
+pub struct QemuInstance {
+    cmd: FxSystemCommand,
+    qemu: QemuSupportedArch,
+    fx_id: FxId,
+    machine_configuration: QemuMachineConfiguration,
+    system_configuration: SystemConfiguration,
+    status: qapi::qmp::StatusInfo,
+    qapi_event_tx: Sender<qapi::qmp::Event>,
+    pub(crate) qapi_event_rx: Receiver<qapi::qmp::Event>,
+    //qga_cmd_tx: Option<Sender<qapi::qga::QgaCommand>>,
+}
+
+impl Debug for QemuInstance {
+    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl Ord for QemuInstance {
+    fn cmp(&self, _other: &Self) -> Ordering {
+        todo!()
+    }
+}
+
+impl PartialOrd for QemuInstance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for QemuInstance {}
+
+impl PartialEq for QemuInstance {
+    fn eq(&self, _other: &Self) -> bool {
+        todo!()
+    }
+}
+
+impl QemuInstance {
+    pub fn existing_or_new(
+        _system_configuration: &SystemConfiguration,
+        _machine_configuration: QemuMachineConfiguration,
+        _fx_id: &FxId,
+    ) -> Result<Self, CreateError> {
+        todo!()
+    }
+
+    pub fn ctl_socket_path(&self) -> PathBuf {
+        QemuInstance::ctl_socket_path_s(&self.system_configuration.vm_root_path, &self.fx_id)
+    }
+    pub fn ctl_socket_log_path(&self) -> PathBuf {
+        QemuInstance::ctl_socket_log_path_s(&self.system_configuration.vm_root_path, &self.fx_id)
+    }
+
+    pub fn ctl_socket_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("run");
+        mon_path.push("ctl.sock");
+        mon_path
+    }
+    pub fn ctl_socket_log_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("log");
+        mon_path.push("ctl.log");
+        mon_path
+    }
+
+    pub fn pid_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("run");
+        mon_path.push(QEMU_PID_FILENAME);
+        mon_path
+    }
+
+    pub fn ctl_debug_socket_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("run");
+        mon_path.push("ctl_debug.sock");
+        mon_path
+    }
+
+    pub fn ctl_debug_socket_log_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("log");
+        mon_path.push("ctl_debug.log");
+        mon_path
+    }
+
+    pub fn ctl_readline_socket_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("run");
+        mon_path.push("ctl_readline.sock");
+        mon_path
+    }
+
+    pub fn ctl_readline_socket_log_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("log");
+        mon_path.push("ctl_readline.log");
+        mon_path
+    }
+
+    pub fn ga_socket_path(&self) -> PathBuf {
+        QemuInstance::ga_socket_path_s(&self.system_configuration.vm_root_path, &self.fx_id)
+    }
+    pub fn ga_socket_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("run");
+        mon_path.push("ga.sock");
+        mon_path
+    }
+    pub fn ga_socket_log_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
+        let mut mon_path = root.to_path_buf();
+        mon_path.push(fx_id.to_string());
+        mon_path.push("log");
+        mon_path.push("guest_agent.log");
+        mon_path
+    }
+
+    pub fn has_ga(&self) -> bool {
+        let mut enabled = false;
+        match &self.machine_configuration.conf {
+            QemuMachineConfigurationByArch::Amd64(qemu) => enabled = qemu.common.enable_guest_agent,
+            QemuMachineConfigurationByArch::Aarch64(qemu) => enabled = qemu.common.enable_guest_agent,
+        }
+        enabled
+    }
+
+    pub async fn call_api<T: qapi::Command + QmpCommand + Debug>(&mut self, qemu_handle: &QemuHandle, cmd: T) -> Result<T::Ok, CallApiError> {
+        trace!("qemu:api cmd:{:?}", &cmd);
+        match qemu_handle.ctl.execute(cmd).await {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                error!("qemu:api:cmd error:{:#?}", err);
+                Err(CallApiError::Executor(err))
+            }
+        }
+    }
+
+    pub async fn call_ga_api<T: qapi::Command + QgaCommand + Debug>(&mut self, qemu_handle: &QemuHandle, cmd: T) -> Result<T::Ok, CallApiError> {
+        match &qemu_handle.ga {
+            None => Err(CallApiError::NoGaAvailable),
+            Some(qga_handle) => {
+                debug!("qemu:qga cmd:{:?}", &cmd);
+                match tokio::time::timeout(std::time::Duration::from_secs(3), qga_handle.execute(cmd)).await {
+                    Ok(g) => match g {
+                        Ok(result) => Ok(result),
+                        Err(err) => {
+                            error!("qemu:qga:cmd error:{:#?}", err);
+                            Err(CallApiError::Executor(err))
+                        }
+                    },
+                    Err(timeout_error) => Err(CallApiError::Timeout(timeout_error)),
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl FxControl for QemuInstance {
+    type Id = uuid::Uuid;
+
+    fn id(&self) -> Self::Id {
+        match self.fx_id {
+            FxId::UuidV4(u) => u,
+            _ => {
+                unreachable!()
+            }
+        }
+    }
+
+    type FxAllocateResult = ();
+    type FxAllocateError = AllocateError;
+    async fn fx_allocate<T: MetadataManager>(
+        &mut self,
+        host_id: &HostId,
+        fx_id: &FxId,
+        mdt: &mut T,
+        rc: &impl FxResourceConstraints,
+        storage: &mut impl SysStorage,
+    ) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
+        let mut root_path = PathBuf::from(&self.system_configuration.vm_root_path);
+        root_path.push(self.fx_id.to_string());
+        let _ = tokio::fs::create_dir_all(&root_path).await;
+        for dir in ["log", "run"] {
+            let mut new_path = root_path.clone();
+            new_path.push(dir);
+            trace!("qemu:spawn creating dir:{}", &new_path.display());
+            let _ = tokio::fs::create_dir(&new_path).await;
+        }
+
+        let mut data_root_path = PathBuf::from(&self.system_configuration.vm_data_root_path);
+        data_root_path.push(self.fx_id.to_string());
+        let _ = tokio::fs::create_dir_all(&data_root_path).await;
+
+        match storage.sys_storage_create(&self.system_configuration, host_id, mdt, fx_id, rc).await {
+            Ok(result) => {
+                info!("qemu:instance:allocate result:success {:?}", result);
+                Ok(())
+            }
+            Err(err) => {
+                error!("qemu:instance:allocate result:{:?}", err);
+                Err(AllocateError::StorageNotOk)
+            }
+        }
+    }
+
+    type FxSpawnResult = QemuHandle;
+    type FxSpawnError = SpawnError;
+
+    async fn fx_start<T: MetadataManager>(
+        &mut self,
+        host_id: &HostId,
+        fx_id: &FxId,
+        mdt: &mut T,
+        rc: &impl FxResourceConstraints,
+        storage: &mut impl SysStorage,
+    ) -> Result<Self::FxSpawnResult, Self::FxSpawnError> {
+        let root_path = PathBuf::from(&self.system_configuration.vm_root_path);
+
+        let mut qemu_stdout_path = root_path.clone();
+        qemu_stdout_path.push("log");
+        qemu_stdout_path.push("qemu_stdout.log");
+        let _qemu_stdout_file = tokio::fs::File::create(qemu_stdout_path).await?;
+
+        let mut qemu_stderr_path = root_path.clone();
+        qemu_stderr_path.push("log");
+        qemu_stderr_path.push("qemu_stderr.log");
+        let _qemu_stderr_file = tokio::fs::File::create(qemu_stderr_path).await?;
+
+        let mut args = self.qemu.to_command();
+        let cmd = args.remove(0);
+
+        self.cmd.command = cmd;
+        self.cmd.args = args;
+
+        match self.cmd.fx_start(host_id, fx_id, mdt, rc, storage).await {
+            Ok(_x) => {
+                match try_connect_ctl_socket(&self.ctl_socket_path()).await {
+                    Ok((api, events)) => {
+                        let pidfile = QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id);
+                        let qapi_event_tx = self.qapi_event_tx.clone();
+
+                        match try_monitor_qemu_with_api(api, events, qapi_event_tx, pidfile).await {
+                            Ok(mut handle) => {
+                                match mdt.metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(1)).await {
+                                    // TODO pid from pidfile
+                                    Ok(_) => {
+                                        if self.has_ga() {
+                                            match try_connect_ga_socket(&self.ga_socket_path()).await {
+                                                Ok((qga, _qga_handle)) => {
+                                                    // TODO does this fail because qga_handle is dropped?
+                                                    handle.ga = Some(qga);
+                                                    Ok(handle)
+                                                }
+                                                Err(qga_connect_timed_out) => {
+                                                    error!("qemu:spawn guest_agent timed out {}", qga_connect_timed_out);
+                                                    Err(SpawnError::Timeout(qga_connect_timed_out))
+                                                }
+                                            }
+                                        } else {
+                                            Ok(handle)
+                                        }
+                                    }
+                                    Err(metadata_update_err) => {
+                                        error!("qemu:spawn metadata:update error:{:?}", metadata_update_err);
+                                        Err(SpawnError::Db)
+                                    }
+                                }
+                            }
+                            Err(spawn_err) => {
+                                error!("qemu:spawn metadata:update error:{:?}", spawn_err);
+                                Err(spawn_err)
+                            }
+                        }
+                    }
+                    Err(timeout_err) => {
+                        error!("qemu:spawn timed out spawning+monitoring:{:?}", timeout_err);
+                        Err(SpawnError::Timeout(timeout_err))
+                    }
+                }
+            }
+            Err(_err) => {
+                todo!()
+            }
+        }
+    }
+
+    type FxStatusResult = ();
+    type FxStatusError = ();
+
+    async fn fx_status(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatusResult, Self::FxStatusError> {
+        match self.call_api(handle, qapi::qmp::query_status {}).await {
+            Ok(status) => {
+                debug!("qemu:operation status info:{:?}", &status);
+                self.status = status; //
+            }
+            Err(status_err) => {
+                error!("qemu:operation status error:{:?}", status_err);
+                self.status = qapi::qmp::StatusInfo {
+                    running: false,
+                    status: qapi::qmp::RunState::io_error,
+                };
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    type FxStopResult = ();
+    type FxStopError = ();
+
+    async fn fx_stop(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStopResult, Self::FxStopError> {
+        let x = self.call_api(handle, qapi::qmp::system_powerdown {}).await;
+        info!("qemu:operation stop {:#?}", x);
+        Ok(())
+    }
+
+    type FxDestroyResult = ();
+    type FxDestroyError = ();
+
+    async fn fx_destroy(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
+        todo!()
+    }
+
+    type FxArchiveResult = ();
+    type FxArchiveError = ();
+
+    async fn fx_archive(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxArchiveResult, Self::FxArchiveError> {
+        todo!()
+    }
+}
+#[async_trait]
+impl FxVerify for QemuInstance {
+    type FxOpVerifyError = VerifyError;
+
+    async fn fx_op_verify(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Verification, Self::FxOpVerifyError> {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl StatsCollect for QemuInstance {
+    type FxStatCollectResult = ();
+    type FxStatCollectError = ();
+
+    async fn stat_collect(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatCollectResult, Self::FxStatCollectError> {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl StateCollect for QemuInstance {
+    type FxStateCollectResult = ();
+    type FxStateCollectError = ();
+
+    async fn state_collect(&mut self, _handle: &mut Self::FxSpawnResult) -> Result<Self::FxStateCollectResult, Self::FxStateCollectError> {
+        todo!()
+    }
+}
+#[async_trait]
+impl FxAccounting for QemuInstance {
+    type Instance = ();
+
+    async fn accumulated_cpu_time(&self, _i: &Self::Instance) -> u64 {
+        todo!()
+    }
+
+    async fn disk_usage(&self, _i: &Self::Instance) -> DiskUsage {
+        todo!()
+    }
+
+    async fn memory(&self, _i: &Self::Instance) -> u64 {
+        todo!()
+    }
+
+    async fn virtual_memory(&self, _i: &Self::Instance) -> u64 {
+        todo!()
+    }
+
+    async fn run_time(&self, _i: &Self::Instance) -> u64 {
+        todo!()
+    }
+}

@@ -1,0 +1,126 @@
+use crate::SpawnError;
+use crate::handle::QemuHandle;
+use crate::instance::{QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS, QEMU_WAIT_UDS_TIMEOUT_SECS};
+use becky_utils::get_process;
+use futures::StreamExt;
+use qapi::futures::{QapiEvents, QapiService, QgaStreamTokio, QmpStreamTokio};
+use qapi::qmp::Event;
+use std::path::PathBuf;
+use tokio::io::{ReadHalf, WriteHalf};
+use tokio::net::UnixStream;
+use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
+use tracing::{debug, error, info, warn};
+
+pub async fn try_connect_ctl_socket(
+    path_socket_ctl: &PathBuf,
+) -> Result<
+    (
+        QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
+        QapiEvents<QmpStreamTokio<ReadHalf<UnixStream>>>,
+    ),
+    Elapsed,
+> {
+    debug!(
+        "qemu:qmp:socket waiting up to {} seconds for control socket at {} to be available...",
+        QEMU_WAIT_UDS_TIMEOUT_SECS,
+        &path_socket_ctl.as_path().display(),
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(QEMU_WAIT_UDS_TIMEOUT_SECS), async {
+        loop {
+            match qapi::futures::QmpStreamTokio::open_uds(path_socket_ctl).await {
+                Ok(stream) => {
+                    info!("qemu:qmp:socket state:connected version:{:?}", stream.capabilities.QMP.version);
+                    match stream.negotiate().await {
+                        Ok(stream) => {
+                            let (api, events) = stream.into_parts();
+                            return (api, events);
+                        }
+                        Err(negotiate_err) => {
+                            warn!(
+                                "qemu:qmp:socket negotiate failed with error:{}, trying again after {} milliseconds",
+                                negotiate_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                        }
+                    }
+                }
+                Err(open_uds_err) => {
+                    warn!(
+                        "qemu:qmp:socket open_uds() failed with error:{}, trying again after {} milliseconds",
+                        open_uds_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                }
+            }
+        }
+    })
+    .await
+}
+
+pub async fn try_monitor_qemu_with_api(
+    api: QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
+    mut events: QapiEvents<QmpStreamTokio<ReadHalf<UnixStream>>>,
+    tx: Sender<Event>,
+    pidfile: PathBuf,
+) -> Result<QemuHandle, SpawnError> {
+    tokio::spawn(async move {
+        // read events from the API control socket and send to our worker process
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(ev) => match tx.send(ev).await {
+                    Ok(_empty) => {}
+                    Err(send_err) => {
+                        error!("qemu:event send failed: {:?}", send_err);
+                    }
+                },
+                Err(event_err) => {
+                    error!("qemu:event read error: {:?}", event_err);
+                }
+            }
+        }
+    });
+
+    let content = tokio::fs::read_to_string(&pidfile).await?;
+    let content = content.trim();
+    let pid = content.parse::<u32>().map_err(SpawnError::ParsePid)?;
+    let proc = get_process(pid).ok_or(SpawnError::PidNotFound)?;
+    info!("qemu:monitoring pid:{}", pid);
+    Ok(QemuHandle {
+        process: proc,
+        ctl: api,
+        version: None,
+        schema: vec![],
+        ga: None,
+    })
+}
+
+pub async fn try_connect_ga_socket(path_socket_ga: &PathBuf) -> Result<(QapiService<QgaStreamTokio<WriteHalf<UnixStream>>>, JoinHandle<()>), Elapsed> {
+    debug!(
+        "qemu:qga:socket waiting up to {} seconds for guest agent socket at {} to be available...",
+        QEMU_WAIT_UDS_TIMEOUT_SECS,
+        &path_socket_ga.as_path().display(),
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(QEMU_WAIT_UDS_TIMEOUT_SECS), async {
+        loop {
+            match qapi::futures::QgaStreamTokio::open_uds(path_socket_ga).await {
+                Ok(stream) => {
+                    info!("qemu:qga:connected version",);
+                    let (qga, handle) = stream.spawn_tokio();
+                    return (qga, handle);
+                }
+                Err(open_err) => {
+                    warn!(
+                        "qemu:qga:open_uds failed with error:{}, trying again after {} milliseconds",
+                        open_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                }
+            }
+        }
+    })
+    .await
+}
