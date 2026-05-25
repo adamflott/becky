@@ -60,6 +60,10 @@ pub enum FxSysCommandError {
     /// The process id was not found in the process table.
     #[error("pid {0} not found")]
     PidNotFound(u32),
+
+    /// The process exists but its command vector is empty.
+    #[error("pid {0} has an empty command vector")]
+    EmptyCommand(u32),
 }
 
 /// A Unix process scheduling priority used with `nice`.
@@ -149,9 +153,9 @@ pub struct FxSystemCommand {
     pub pin_to_cpus: Option<Vec<usize>>,
 }
 
-struct SystemProcessRunningTokio {
+pub struct SystemProcessRunningTokio {
     handle: JoinHandle<tokio::io::Result<ExitStatus>>,
-    tx: Sender<()>,
+    _tx: Sender<()>,
     pid: u32,
     child: Arc<RwLock<tokio::process::Child>>,
 }
@@ -264,44 +268,42 @@ impl FxSystemProcessRunning {
     /// This requests graceful termination and does not wait for the process to
     /// exit.
     pub fn stop(&self) -> Result<(), FxSysCommandError> {
-        let s = System::new_all();
-        let pid = self.get_pid();
-        if let Some(process) = s.process(Pid::from_u32(pid)) {
-            match process.kill_with(sysinfo::Signal::Term) {
-                None => Err(FxSysCommandError::SignalFailedToSend),
-                Some(b) => {
-                    if b {
-                        Ok(())
-                    } else {
-                        Err(FxSysCommandError::SignalFailedToSend)
-                    }
-                }
-            }
-        } else {
-            Err(FxSysCommandError::ProcessNotRunning)
+        match self {
+            FxSystemProcessRunning::Tokio(handle) => signal_process_group(handle.pid, libc::SIGTERM),
+            FxSystemProcessRunning::Pid(pid) => signal_process(*pid, sysinfo::Signal::Term),
         }
     }
 
     /// Sends `SIGKILL` to the tracked process.
     pub fn destroy(&self) -> Result<(), FxSysCommandError> {
-        let s = System::new_all();
-        let pid = self.get_pid();
-
-        if let Some(process) = s.process(Pid::from_u32(pid)) {
-            match process.kill_with(sysinfo::Signal::Kill) {
-                None => Err(FxSysCommandError::SignalFailedToSend),
-                Some(b) => {
-                    if b {
-                        Ok(())
-                    } else {
-                        Err(FxSysCommandError::SignalFailedToSend)
-                    }
-                }
-            }
-        } else {
-            Err(FxSysCommandError::ProcessNotRunning)
+        match self {
+            FxSystemProcessRunning::Tokio(handle) => signal_process_group(handle.pid, libc::SIGKILL),
+            FxSystemProcessRunning::Pid(pid) => signal_process(*pid, sysinfo::Signal::Kill),
         }
     }
+}
+
+fn signal_process(pid: u32, signal: sysinfo::Signal) -> Result<(), FxSysCommandError> {
+    let s = System::new_all();
+    if let Some(process) = s.process(Pid::from_u32(pid)) {
+        match process.kill_with(signal) {
+            Some(true) => Ok(()),
+            Some(false) | None => Err(FxSysCommandError::SignalFailedToSend),
+        }
+    } else {
+        Err(FxSysCommandError::ProcessNotRunning)
+    }
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) -> Result<(), FxSysCommandError> {
+    let s = System::new_all();
+    if s.process(Pid::from_u32(pid)).is_none() {
+        return Err(FxSysCommandError::ProcessNotRunning);
+    }
+
+    #[allow(unsafe_code)]
+    let sent = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if sent == 0 { Ok(()) } else { Err(FxSysCommandError::SignalFailedToSend) }
 }
 
 /// Compares a command and its arguments with a slice of `OsString`.
@@ -353,10 +355,13 @@ impl FxSystemCommand {
     pub fn new_from_pid(pid: u32) -> Result<Self, FxSysCommandError> {
         let s = System::new_all();
         if let Some(process) = s.process(Pid::from_u32(pid)) {
+            let Some((command, args)) = process.cmd().split_first() else {
+                return Err(FxSysCommandError::EmptyCommand(pid));
+            };
             // TODO get nice level from /proc/pid/stat on linux
             Ok(Self {
-                command: process.cmd()[0].to_string_lossy().to_string(),
-                args: process.cmd()[1..].iter().map(|x| x.to_string_lossy().to_string()).collect(),
+                command: command.to_string_lossy().to_string(),
+                args: args.iter().map(|x| x.to_string_lossy().to_string()).collect(),
                 state: FxExecutionState::Running(pid),
                 desired_state: FxDesiredExecutionState::Running,
                 nice_level: None,
@@ -503,12 +508,8 @@ impl FxControl for FxSystemCommand {
                 #[cfg(target_os = "linux")]
                 let (cmd, args) = match &self.pin_to_cpus {
                     Some(cpus) => {
-                        let mut cpu_args = vec![
-                            "-c".to_string(),
-                            cpus.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(","),
-                            self.command.to_string(),
-                        ];
-                        cpu_args.append(&mut self.args.clone());
+                        let mut cpu_args = vec!["-c".to_string(), cpus.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(","), cmd];
+                        cpu_args.extend(args);
                         ("taskset".to_string(), cpu_args)
                     }
                     None => (cmd, args),
@@ -558,7 +559,7 @@ impl FxControl for FxSystemCommand {
 
                 let handle = SystemProcessRunningTokio {
                     handle,
-                    tx,
+                    _tx: tx,
                     pid,
                     child: shared_child,
                 };
@@ -575,10 +576,9 @@ impl FxControl for FxSystemCommand {
     /// Tokio-spawned children are checked with `try_wait`. Pid-only processes
     /// are looked up through `sysinfo`.
     ///
-    /// The current result convention differs by process handle. Tokio-spawned
-    /// children report still-running as `Err(FxExecutionState::NotStarted)` and
-    /// exited children as `Err(FxExecutionState::Exited(_))`. Pid-only handles
-    /// report their observed state through `Ok(...)`.
+    /// Tokio-spawned children and pid-only handles both report observed
+    /// lifecycle states through `Ok(...)`. Actual status lookup failures are
+    /// returned as `Err(FxExecutionState::Error(_))`.
     async fn fx_status(&mut self, process: &mut Self::FxSpawnResult) -> Result<Self::FxStatusResult, Self::FxStatusError> {
         match process {
             FxSystemProcessRunning::Tokio(handle) => match handle.child.write().await.try_wait() {
