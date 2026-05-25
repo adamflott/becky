@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::comm::{try_connect_ctl_socket, try_connect_ga_socket, try_monitor_qemu_with_api};
 use crate::handle::QemuHandle;
 use crate::{
-    AllocateError, CallApiError, CreateError, QEMU_PID_FILENAME, QemuMachineConfiguration, QemuMachineConfigurationByArch, QemuSupportedArch, SpawnError,
-    VerifyError,
+    AllocateError, ArchiveError, CallApiError, CreateError, QEMU_PID_FILENAME, QemuMachineConfiguration, QemuMachineConfigurationByArch, QemuSupportedArch,
+    SpawnError, VerifyError,
 };
 use async_trait::async_trait;
 use becky_engine::FxAccounting;
@@ -38,6 +38,7 @@ use tracing::{debug, error, info, trace};
 pub const QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS: u64 = 100;
 pub const QEMU_WAIT_UDS_TIMEOUT_SECS: u64 = 3;
 pub const QEMU_API_EVENT_BUFFER_SIZE: usize = 100;
+const QEMU_ARCHIVE_DIR: &str = "archive";
 
 fn vec_to_btreemap_shell_string(vs: Vec<(std::string::String, std::string::String)>) -> BTreeMap<ShellString, ShellString> {
     let mut btreemap = BTreeMap::new();
@@ -101,9 +102,16 @@ impl QemuInstance {
     ) -> Result<Self, CreateError> {
         let qemu = qemu_from_machine_configuration(system_configuration, &machine_configuration, fx_id)?;
         let (qapi_event_tx, qapi_event_rx) = tokio::sync::mpsc::channel(QEMU_API_EVENT_BUFFER_SIZE);
+        let mut cmd = command_from_qemu(&qemu);
+        reconcile_existing_files(system_configuration, fx_id);
+
+        if let Some(pid) = live_pid_from_pidfile(&QemuInstance::pid_path_s(&system_configuration.vm_root_path, fx_id)) {
+            cmd.state = FxExecutionState::Running(pid);
+            cmd.desired_state = FxDesiredExecutionState::Running;
+        }
 
         Ok(Self {
-            cmd: FxSystemCommand::new(String::new(), vec![], FxDesiredExecutionState::Running),
+            cmd,
             qemu,
             fx_id: fx_id.clone(),
             machine_configuration,
@@ -145,6 +153,13 @@ impl QemuInstance {
         mon_path.push("run");
         mon_path.push(QEMU_PID_FILENAME);
         mon_path
+    }
+
+    pub fn archive_root_path(&self) -> PathBuf {
+        let mut path = self.system_configuration.vm_root_path.clone();
+        path.push(self.fx_id.to_string());
+        path.push(QEMU_ARCHIVE_DIR);
+        path
     }
 
     pub fn ctl_debug_socket_path_s(root: &Path, fx_id: &FxId) -> PathBuf {
@@ -233,6 +248,28 @@ impl QemuInstance {
             }
         }
     }
+}
+
+fn command_from_qemu(qemu: &QemuSupportedArch) -> FxSystemCommand {
+    let mut args = qemu.to_command();
+    let cmd = if args.is_empty() { String::new() } else { args.remove(0) };
+    FxSystemCommand::new(cmd, args, FxDesiredExecutionState::Running)
+}
+
+fn live_pid_from_pidfile(pidfile: &Path) -> Option<u32> {
+    let pid = std::fs::read_to_string(pidfile).ok()?.trim().parse::<u32>().ok()?;
+    System::new_all().process(Pid::from_u32(pid)).is_some().then_some(pid)
+}
+
+fn reconcile_existing_files(system_configuration: &SystemConfiguration, fx_id: &FxId) {
+    let pidfile = QemuInstance::pid_path_s(&system_configuration.vm_root_path, fx_id);
+    if live_pid_from_pidfile(&pidfile).is_some() {
+        return;
+    }
+
+    let _ = std::fs::remove_file(pidfile);
+    let _ = std::fs::remove_file(QemuInstance::ctl_socket_path_s(&system_configuration.vm_root_path, fx_id));
+    let _ = std::fs::remove_file(QemuInstance::ga_socket_path_s(&system_configuration.vm_root_path, fx_id));
 }
 
 fn state_from_qmp_status(status: &qapi::qmp::StatusInfo, pid: u32) -> FxExecutionState {
@@ -381,6 +418,29 @@ impl FxControl for QemuInstance {
         rc: &impl FxResourceConstraints,
         storage: &mut impl SysStorage,
     ) -> Result<Self::FxSpawnResult, Self::FxSpawnError> {
+        if live_pid_from_pidfile(&QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id)).is_some() && self.ctl_socket_path().exists() {
+            match try_connect_ctl_socket(&self.ctl_socket_path()).await {
+                Ok((api, events)) => {
+                    let pidfile = QemuInstance::pid_path_s(&self.system_configuration.vm_root_path, &self.fx_id);
+                    let qapi_event_tx = self.qapi_event_tx.clone();
+                    let mut handle = try_monitor_qemu_with_api(api, events, qapi_event_tx, pidfile).await?;
+                    mdt.metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(handle.process.pid))
+                        .await
+                        .map_err(|_| SpawnError::Db)?;
+
+                    if self.has_ga() {
+                        let (qga, _qga_handle) = try_connect_ga_socket(&self.ga_socket_path()).await.map_err(SpawnError::Timeout)?;
+                        handle.ga = Some(qga);
+                    }
+
+                    return Ok(handle);
+                }
+                Err(timeout_err) => {
+                    debug!("qemu:reattach timed out, attempting fresh start:{:?}", timeout_err);
+                }
+            }
+        }
+
         let root_path = PathBuf::from(&self.system_configuration.vm_root_path);
 
         let mut qemu_stdout_path = root_path.clone();
@@ -393,11 +453,7 @@ impl FxControl for QemuInstance {
         qemu_stderr_path.push("qemu_stderr.log");
         let _qemu_stderr_file = tokio::fs::File::create(qemu_stderr_path).await?;
 
-        let mut args = self.qemu.to_command();
-        let cmd = args.remove(0);
-
-        self.cmd.command = cmd;
-        self.cmd.args = args;
+        self.cmd = command_from_qemu(&self.qemu);
 
         match self.cmd.fx_start(host_id, fx_id, mdt, rc, storage).await {
             Ok(_x) => {
@@ -408,8 +464,10 @@ impl FxControl for QemuInstance {
 
                         match try_monitor_qemu_with_api(api, events, qapi_event_tx, pidfile).await {
                             Ok(mut handle) => {
-                                match mdt.metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(1)).await {
-                                    // TODO pid from pidfile
+                                match mdt
+                                    .metadata_fx_state_update(host_id, fx_id, FxExecutionState::Running(handle.process.pid))
+                                    .await
+                                {
                                     Ok(_) => {
                                         if self.has_ga() {
                                             match try_connect_ga_socket(&self.ga_socket_path()).await {
@@ -451,14 +509,16 @@ impl FxControl for QemuInstance {
         }
     }
 
-    type FxStatusResult = ();
-    type FxStatusError = ();
+    type FxStatusResult = FxExecutionState;
+    type FxStatusError = CallApiError;
 
     async fn fx_status(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatusResult, Self::FxStatusError> {
         match self.call_api(handle, qapi::qmp::query_status {}).await {
             Ok(status) => {
                 debug!("qemu:operation status info:{:?}", &status);
-                self.status = status; //
+                let state = state_from_qmp_status(&status, handle.process.pid);
+                self.status = status;
+                Ok(state)
             }
             Err(status_err) => {
                 error!("qemu:operation status error:{:?}", status_err);
@@ -466,10 +526,9 @@ impl FxControl for QemuInstance {
                     running: false,
                     status: qapi::qmp::RunState::io_error,
                 };
-                return Err(());
+                Err(status_err)
             }
         }
-        Ok(())
     }
 
     type FxStopResult = ();
@@ -489,11 +548,24 @@ impl FxControl for QemuInstance {
         Ok(())
     }
 
-    type FxArchiveResult = ();
-    type FxArchiveError = ();
+    type FxArchiveResult = PathBuf;
+    type FxArchiveError = ArchiveError;
 
-    async fn fx_archive(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxArchiveResult, Self::FxArchiveError> {
-        Ok(())
+    async fn fx_archive(&self, fnr: &mut Self::FxSpawnResult) -> Result<Self::FxArchiveResult, Self::FxArchiveError> {
+        let archive_root = self.archive_root_path();
+        tokio::fs::create_dir_all(&archive_root).await?;
+        let archive_path = archive_root.join("vmstate.snap");
+        let tag = format!("becky-{}", self.fx_id);
+        fnr.ctl
+            .execute(qapi::qmp::snapshot_save {
+                devices: vec![],
+                job_id: tag.clone(),
+                tag,
+                vmstate: archive_path.display().to_string(),
+            })
+            .await
+            .map_err(CallApiError::Executor)?;
+        Ok(archive_path)
     }
 }
 #[async_trait]

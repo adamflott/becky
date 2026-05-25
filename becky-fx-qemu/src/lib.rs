@@ -572,6 +572,15 @@ pub enum VerifyError {
 }
 
 #[derive(Error, Debug)]
+pub enum ArchiveError {
+    #[error("io")]
+    IO(#[from] std::io::Error),
+
+    #[error("api")]
+    CallApiError(#[from] CallApiError),
+}
+
+#[derive(Error, Debug)]
 pub enum QemuStorageCreateError {
     #[error("io")]
     IO(#[from] std::io::Error),
