@@ -503,8 +503,9 @@ impl FxControl for QemuInstance {
                     }
                 }
             }
-            Err(_err) => {
-                todo!()
+            Err(err) => {
+                error!("qemu:spawn system command failed:{:?}", err);
+                Err(SpawnError::SystemCommand(err))
             }
         }
     }

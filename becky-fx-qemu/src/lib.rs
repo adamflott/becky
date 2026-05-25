@@ -17,6 +17,7 @@ use becky_engine::metadata::MetadataManager;
 use becky_engine::storage::{StorageResizeRequest, SysStorage};
 use becky_engine::sys_conf::SystemConfiguration;
 use becky_fx_id::FxId;
+use becky_fx_system_command::FxSysCommandError;
 use becky_utils::{CommandOptions, CommandRanError, run_system_command};
 use bon::Builder;
 use qemu_command_builder::args::cpu_type::{CpuNotFound, CpuTypeAarch64, CpuTypeX86_64};
@@ -602,6 +603,9 @@ pub enum QemuStorageCreateError {
 pub enum SpawnError {
     #[error("io")]
     Io(#[from] std::io::Error),
+
+    #[error("system command")]
+    SystemCommand(#[from] FxSysCommandError),
 
     #[error("pid not found")]
     PidNotFound,
