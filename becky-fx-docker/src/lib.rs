@@ -196,7 +196,7 @@ pub struct DockerContainerHandle {
 
     latest_state: Arc<RwLock<FxExecutionState>>,
     cancel_monitor: Sender<()>,
-    monitor: JoinHandle<()>,
+    monitor: Option<JoinHandle<()>>,
 }
 
 impl Debug for DockerContainerHandle {
@@ -205,7 +205,7 @@ impl Debug for DockerContainerHandle {
             .field("id", &self.id)
             .field("name", &self.name)
             .field("created", &self.created)
-            .field("monitor_finished", &self.monitor.is_finished())
+            .field("monitor_finished", &self.monitor.as_ref().is_none_or(JoinHandle::is_finished))
             .finish_non_exhaustive()
     }
 }
@@ -216,9 +216,14 @@ impl DockerContainerHandle {
         self.latest_state.read().await.clone()
     }
 
-    /// Requests monitor shutdown. This does not stop the Docker container.
-    pub async fn stop_monitor(&self) {
+    /// Requests monitor shutdown and waits for the monitor task to finish.
+    ///
+    /// This does not stop the Docker container.
+    pub async fn stop_monitor(&mut self) {
         let _ = self.cancel_monitor.send(()).await;
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.await;
+        }
     }
 }
 
@@ -323,7 +328,7 @@ async fn inspect_container(name: &str) -> Result<DockerInspectContainer, FxDocke
 async fn container_exists(name: &str) -> Result<bool, FxDockerError> {
     match docker_ok(&["container", "inspect", name]).await {
         Ok(()) => Ok(true),
-        Err(FxDockerError::DockerExit { .. }) => Ok(false),
+        Err(err @ FxDockerError::DockerExit { .. }) if docker_not_found(&err, DockerResourceKind::Container) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -331,7 +336,7 @@ async fn container_exists(name: &str) -> Result<bool, FxDockerError> {
 async fn image_exists(image: &str) -> Result<bool, FxDockerError> {
     match docker_ok(&["image", "inspect", image]).await {
         Ok(()) => Ok(true),
-        Err(FxDockerError::DockerExit { .. }) => Ok(false),
+        Err(err @ FxDockerError::DockerExit { .. }) if docker_not_found(&err, DockerResourceKind::Image) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -348,7 +353,7 @@ async fn ensure_image(image: &str) -> Result<(), FxDockerError> {
 async fn network_exists(name: &str) -> Result<bool, FxDockerError> {
     match docker_ok(&["network", "inspect", name]).await {
         Ok(()) => Ok(true),
-        Err(FxDockerError::DockerExit { .. }) => Ok(false),
+        Err(err @ FxDockerError::DockerExit { .. }) if docker_not_found(&err, DockerResourceKind::Network) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -363,6 +368,25 @@ async fn ensure_network(name: &str) -> Result<(), FxDockerError> {
 
 fn trim_docker_name(name: &str) -> String {
     name.strip_prefix('/').unwrap_or(name).to_string()
+}
+
+enum DockerResourceKind {
+    Container,
+    Image,
+    Network,
+}
+
+fn docker_not_found(err: &FxDockerError, kind: DockerResourceKind) -> bool {
+    let FxDockerError::DockerExit { stderr, .. } = err else {
+        return false;
+    };
+
+    let stderr = stderr.to_ascii_lowercase();
+    match kind {
+        DockerResourceKind::Container => stderr.contains("no such container"),
+        DockerResourceKind::Image => stderr.contains("no such image") || stderr.contains("no such object"),
+        DockerResourceKind::Network => stderr.contains("no such network"),
+    }
 }
 
 fn inspect_to_state(inspect: &DockerInspectContainer) -> FxExecutionState {
@@ -389,7 +413,7 @@ fn monitor_handle(inspect: DockerInspectContainer, created: bool) -> DockerConta
         created,
         latest_state,
         cancel_monitor,
-        monitor,
+        monitor: Some(monitor),
     }
 }
 
@@ -613,7 +637,7 @@ impl FxControl for FxContainerDocker {
             }
             Err(err) => {
                 warn!("docker:status inspect failed container:{} error:{}", self.name, err);
-                Ok(fnr.latest_state().await)
+                Err(err)
             }
         }
     }
