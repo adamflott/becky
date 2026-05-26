@@ -20,6 +20,11 @@ use tracing::{debug, error, info, trace};
 pub const QEMU_STATUS_POLL_SECONDS: u64 = 10;
 pub const QEMU_WORKER_COMMAND_BUFFER_SIZE: usize = 32;
 
+struct ScheduledTask {
+    cancel: Sender<()>,
+    join: JoinHandle<()>,
+}
+
 /// Represents the running instance of QEMU
 pub struct QemuRunningInstance {
     pub(crate) pid: u32,
@@ -198,10 +203,10 @@ impl QemuManager {
     pub async fn pause<T: MetadataManager>(&mut self, _host_id: &HostId, _mdt: &mut T) {}
 }
 
-async fn schedule_event(cmd_tx: Sender<WorkerCommand>, interval: u64, cmd: WorkerCommand) -> Sender<()> {
+async fn schedule_event(cmd_tx: Sender<WorkerCommand>, interval: u64, cmd: WorkerCommand) -> ScheduledTask {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = rx.recv() => {
@@ -223,7 +228,17 @@ async fn schedule_event(cmd_tx: Sender<WorkerCommand>, interval: u64, cmd: Worke
         }
     });
 
-    tx
+    ScheduledTask { cancel: tx, join }
+}
+
+async fn stop_scheduled_tasks(tasks: Vec<ScheduledTask>) {
+    for task in &tasks {
+        let _ = task.cancel.send(()).await;
+    }
+
+    for task in tasks {
+        let _ = task.join.await;
+    }
 }
 
 async fn worker_process(
@@ -237,12 +252,19 @@ async fn worker_process(
 ) -> () {
     info!("qemu:worker starting id:{}", fx_id);
 
-    let mut write_lock = qemu.write().await;
+    let mut event_rx = match qemu.write().await.qemu.take_qapi_event_rx() {
+        Some(event_rx) => event_rx,
+        None => {
+            error!("qemu:worker missing QMP event receiver id:{}", fx_id);
+            handle.stop_event_reader().await;
+            return;
+        }
+    };
 
-    let mut cancelers = vec![];
+    let mut scheduled_tasks = vec![];
 
-    cancelers.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::Qmp(QmpCmd::Status)).await);
-    cancelers.push(
+    scheduled_tasks.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::Qmp(QmpCmd::Status)).await);
+    scheduled_tasks.push(
         schedule_event(
             cmd_tx.clone(),
             QEMU_STATUS_POLL_SECONDS,
@@ -252,9 +274,9 @@ async fn worker_process(
     );
 
     if guest_agent_enabled {
-        cancelers.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::GuestAgent(GuestAgentCmd::Ping)).await);
+        scheduled_tasks.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::GuestAgent(GuestAgentCmd::Ping)).await);
 
-        cancelers.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::GuestAgent(GuestAgentCmd::Info)).await);
+        scheduled_tasks.push(schedule_event(cmd_tx.clone(), QEMU_STATUS_POLL_SECONDS, WorkerCommand::GuestAgent(GuestAgentCmd::Info)).await);
     }
 
     loop {
@@ -264,25 +286,24 @@ async fn worker_process(
                     info!("qemu:worker new cmd:{:?}", &cmd);
                     match &cmd {
                         WorkerCommand::Shutdown => {
-                            for cancel in cancelers {
-                                let _ = cancel.send(()).await;
-                            }
-                            return ;
+                            stop_scheduled_tasks(scheduled_tasks).await;
+                            handle.stop_event_reader().await;
+                            return;
                         }
                         WorkerCommand::Qmp(qmp_cmd) => {
                             match qmp_cmd {
                                 QmpCmd::Status => {
-                                    if let Err(status_err) = write_lock.qemu.fx_status(&mut handle).await {
+                                    if let Err(status_err) = qemu.write().await.qemu.fx_status(&mut handle).await {
                                         error!("qemu:qmp:status error:{:?}", status_err);
                                     }
                                 }
                             QmpCmd::QueryBlock => {
-                                    if let Ok(block) = write_lock.qemu.call_api(&handle, qapi::qmp::query_block { }).await {
+                                    if let Ok(block) = qemu.write().await.qemu.call_api(&handle, qapi::qmp::query_block { }).await {
                                         info!("qemu:qmp:query_block:{:?}", &block);
                                     }
                                 }
                                 QmpCmd::SystemPowerdown => {
-                                    if let Ok(_empty) = write_lock.qemu.fx_stop(&mut handle).await {
+                                    if let Ok(_empty) = qemu.write().await.qemu.fx_stop(&mut handle).await {
                                         info!("qemu:qmp:system_powerdown result:success");
                                     }
                                 }
@@ -291,24 +312,34 @@ async fn worker_process(
                         WorkerCommand::GuestAgent(ga_cmd) => {
                             match ga_cmd {
                                 GuestAgentCmd::Ping => {
-                                    if let Err(ping_err)= write_lock.qemu.call_ga_api(&handle, qapi::qga::guest_ping { }).await {
+                                    if let Err(ping_err)= qemu.write().await.qemu.call_ga_api(&handle, qapi::qga::guest_ping { }).await {
                                         error!("qemu:qga:ping error:{}", ping_err);
                                     }
 
                                 },
                                 GuestAgentCmd::Info => {
-                                    if let Ok(guest_info) = write_lock.qemu.call_ga_api(&handle, qapi::qga::guest_info { }).await {
+                                    if let Ok(guest_info) = qemu.write().await.qemu.call_ga_api(&handle, qapi::qga::guest_info { }).await {
                                         info!("qemu:qga:guest_info version:{}", guest_info.version);
                                     }
                                 }
                             }
                         }
                     }
+                } else {
+                    info!("qemu:worker command channel closed id:{}", fx_id);
+                    stop_scheduled_tasks(scheduled_tasks).await;
+                    handle.stop_event_reader().await;
+                    return;
                 }
             }
-            rmsg = write_lock.qemu.qapi_event_rx.recv() => {
+            rmsg = event_rx.recv() => {
                 if let Some(ev) = rmsg {
                     handle_event(ev, event_tx.clone()).await;
+                } else {
+                    info!("qemu:worker QMP event channel closed id:{}", fx_id);
+                    stop_scheduled_tasks(scheduled_tasks).await;
+                    handle.stop_event_reader().await;
+                    return;
                 }
             }
         }

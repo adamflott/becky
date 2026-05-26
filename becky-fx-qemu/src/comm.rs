@@ -66,7 +66,7 @@ pub async fn try_monitor_qemu_with_api(
     tx: Sender<Event>,
     pidfile: PathBuf,
 ) -> Result<QemuHandle, SpawnError> {
-    tokio::spawn(async move {
+    let event_reader = tokio::spawn(async move {
         // read events from the API control socket and send to our worker process
         while let Some(event) = events.next().await {
             match event {
@@ -97,6 +97,7 @@ pub async fn try_monitor_qemu_with_api(
         ctl: api,
         version: Some(version),
         schema,
+        event_reader,
         ga: None,
     })
 }

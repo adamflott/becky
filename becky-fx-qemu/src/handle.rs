@@ -1,6 +1,7 @@
 use becky_utils::Process;
 use qapi::futures::{QapiService, QgaStreamTokio, QmpStreamTokio};
 use qapi::qmp::{SchemaInfo, VersionInfo};
+use tokio::task::JoinHandle;
 
 pub struct QemuHandle {
     pub process: Process,
@@ -10,6 +11,8 @@ pub struct QemuHandle {
     pub(crate) version: Option<VersionInfo>,
     /// if connected, contains the accepted JSON schema for QMP
     pub(crate) schema: Vec<SchemaInfo>,
+    /// Background reader that forwards QMP events from the socket.
+    pub(crate) event_reader: JoinHandle<()>,
     pub ga: Option<QapiService<QgaStreamTokio<tokio::io::WriteHalf<tokio::net::UnixStream>>>>,
 }
 
@@ -20,6 +23,11 @@ impl QemuHandle {
 
     pub fn supported_command(&self, cmd: &str) -> bool {
         schema_supports_command(&self.schema, cmd)
+    }
+
+    pub async fn stop_event_reader(&mut self) {
+        self.event_reader.abort();
+        let _ = (&mut self.event_reader).await;
     }
 }
 

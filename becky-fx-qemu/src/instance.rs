@@ -56,7 +56,7 @@ pub struct QemuInstance {
     system_configuration: SystemConfiguration,
     status: qapi::qmp::StatusInfo,
     qapi_event_tx: Sender<qapi::qmp::Event>,
-    pub(crate) qapi_event_rx: Receiver<qapi::qmp::Event>,
+    pub(crate) qapi_event_rx: Option<Receiver<qapi::qmp::Event>>,
     //qga_cmd_tx: Option<Sender<qapi::qga::QgaCommand>>,
 }
 
@@ -121,8 +121,12 @@ impl QemuInstance {
                 status: qapi::qmp::RunState::prelaunch,
             },
             qapi_event_tx,
-            qapi_event_rx,
+            qapi_event_rx: Some(qapi_event_rx),
         })
+    }
+
+    pub(crate) fn take_qapi_event_rx(&mut self) -> Option<Receiver<qapi::qmp::Event>> {
+        self.qapi_event_rx.take()
     }
 
     pub fn ctl_socket_path(&self) -> PathBuf {
