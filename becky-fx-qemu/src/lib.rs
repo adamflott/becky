@@ -692,6 +692,9 @@ pub enum SpawnError {
     #[error("uds timeout")]
     Timeout(Elapsed),
 
+    #[error("qmp call failed with error code {0}")]
+    Qmp(#[from] qapi::ExecuteError),
+
     #[error("db")]
     Db,
 }

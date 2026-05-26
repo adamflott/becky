@@ -14,17 +14,42 @@ pub struct QemuHandle {
 }
 
 impl QemuHandle {
+    pub fn version(&self) -> Option<&VersionInfo> {
+        self.version.as_ref()
+    }
+
     pub fn supported_command(&self, cmd: &str) -> bool {
-        let mut found = false;
-        for schema in &self.schema {
-            match schema {
-                SchemaInfo::command { base, .. } if base.name.eq_ignore_ascii_case(cmd) => {
-                    found = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        found
+        schema_supports_command(&self.schema, cmd)
+    }
+}
+
+pub(crate) fn schema_supports_command(schema: &[SchemaInfo], cmd: &str) -> bool {
+    schema.iter().any(|schema| match schema {
+        SchemaInfo::command { base, .. } => base.name.eq_ignore_ascii_case(cmd),
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qapi::qmp::{SchemaInfoBase, SchemaInfoCommand};
+
+    #[test]
+    fn schema_supports_command_matches_case_insensitively() {
+        let schema = vec![SchemaInfo::command {
+            base: SchemaInfoBase {
+                features: None,
+                name: "query-status".to_string(),
+            },
+            command: SchemaInfoCommand {
+                allow_oob: None,
+                arg_type: "q_empty".to_string(),
+                ret_type: "StatusInfo".to_string(),
+            },
+        }];
+
+        assert!(schema_supports_command(&schema, "QUERY-STATUS"));
+        assert!(!schema_supports_command(&schema, "query-block"));
     }
 }

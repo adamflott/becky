@@ -4,7 +4,7 @@ use crate::instance::{QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS, QEMU_WAIT_UDS_TIMEOUT
 use becky_utils::get_process;
 use futures::StreamExt;
 use qapi::futures::{QapiEvents, QapiService, QgaStreamTokio, QmpStreamTokio};
-use qapi::qmp::Event;
+use qapi::qmp::{Event, query_qmp_schema, query_version};
 use std::path::PathBuf;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
@@ -87,12 +87,16 @@ pub async fn try_monitor_qemu_with_api(
     let content = content.trim();
     let pid = content.parse::<u32>().map_err(SpawnError::ParsePid)?;
     let proc = get_process(pid).ok_or(SpawnError::PidNotFound)?;
+    let version = api.execute(query_version {}).await.map_err(SpawnError::Qmp)?;
+    let schema = api.execute(query_qmp_schema {}).await.map_err(SpawnError::Qmp)?;
     info!("qemu:monitoring pid:{}", pid);
+    info!("qemu:qmp:version {:?}", version);
+    debug!("qemu:qmp:schema loaded command_count:{}", schema.len());
     Ok(QemuHandle {
         process: proc,
         ctl: api,
-        version: None,
-        schema: vec![],
+        version: Some(version),
+        schema,
         ga: None,
     })
 }
