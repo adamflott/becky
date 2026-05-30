@@ -30,7 +30,7 @@ libc = "1.0.0-alpha.3"
 libproc = "0.14.11"
 qapi = { version = "0.15.0", features = ["qmp", "async-tokio-all", "qga"] }
 regex = "1.12.3"
-reqwest = { version = "0.13.3", features = ["blocking", "json"] }
+reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive", "serde_derive"] }
 serde_json = "1.0.150"
 sysinfo = "0.39.2"
