@@ -33,7 +33,7 @@ regex = "1.12.3"
 reqwest = { version = "0.13.3", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive", "serde_derive"] }
 serde_json = "1.0.150"
-sysinfo = "0.39.2"
+sysinfo = "0.39.3"
 thiserror = "2.0.18"
 tokio = {  version = "1.52.3", features = [ "full", "signal"] }
 tracing = "0.1.44"
