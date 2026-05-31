@@ -14,6 +14,7 @@ async-trait = { workspace = true}
 becky-engine = { version = "*", path = "../becky-engine" }
 becky-fx-id = { version = "*", path = "../becky-fx-id"}
 becky-utils = { version = "*", path = "../becky-utils" }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }

@@ -19,6 +19,7 @@ use becky_engine::state::FxExecutionState;
 use becky_engine::storage::SysStorage;
 use becky_fx_id::FxId;
 use becky_utils::{CommandOptions, CommandRanError, run_system_command};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sysinfo::DiskUsage;
 use thiserror::Error;
@@ -370,6 +371,17 @@ fn trim_docker_name(name: &str) -> String {
     name.strip_prefix('/').unwrap_or(name).to_string()
 }
 
+fn docker_started_at_runtime_secs(started_at: &str, now: DateTime<Utc>) -> Option<u64> {
+    if started_at.is_empty() || started_at.starts_with("0001-") {
+        return None;
+    }
+
+    DateTime::parse_from_rfc3339(started_at)
+        .ok()
+        .and_then(|started| now.signed_duration_since(started.with_timezone(&Utc)).to_std().ok())
+        .map(|duration| duration.as_secs())
+}
+
 enum DockerResourceKind {
     Container,
     Image,
@@ -702,9 +714,7 @@ impl FxAccounting for FxContainerDocker {
         match self.inspect().await {
             Ok(inspect) => {
                 if inspect.state.running && !inspect.state.started_at.starts_with("0001-") {
-                    // Docker returns RFC3339 timestamps with nanoseconds. Avoid adding
-                    // another time dependency for now; expose presence as nonzero.
-                    1
+                    docker_started_at_runtime_secs(&inspect.state.started_at, Utc::now()).unwrap_or(0)
                 } else {
                     0
                 }
@@ -722,6 +732,16 @@ mod tests {
     fn trims_leading_slash_from_docker_name() {
         assert_eq!(trim_docker_name("/worker"), "worker");
         assert_eq!(trim_docker_name("worker"), "worker");
+    }
+
+    #[test]
+    fn parses_docker_started_at_runtime() {
+        let now = match DateTime::parse_from_rfc3339("2026-05-26T10:00:30Z") {
+            Ok(now) => now.with_timezone(&Utc),
+            Err(err) => panic!("test timestamp should parse: {err}"),
+        };
+        assert_eq!(docker_started_at_runtime_secs("2026-05-26T10:00:00.000000000Z", now), Some(30));
+        assert_eq!(docker_started_at_runtime_secs("0001-01-01T00:00:00Z", now), None);
     }
 
     #[test]

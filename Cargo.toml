@@ -25,6 +25,7 @@ repository = "https://github.com/adamflott/becky"
 async-trait = "0.1.89"
 bon = "3.9.1"
 bytesize = { version = "2.3.1", features = ["serde"] }
+chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env", "cargo", "string"] }
 futures = "0.3.32"
 libc = "1.0.0-alpha.3"
