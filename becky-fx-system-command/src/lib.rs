@@ -154,6 +154,12 @@ pub struct FxSystemCommand {
     /// Optional Linux CPU affinity list applied by launching through `taskset`.
     #[cfg(target_os = "linux")]
     pub pin_to_cpus: Option<Vec<usize>>,
+
+    /// Optional file path for child stdout.
+    pub stdout_path: Option<PathBuf>,
+
+    /// Optional file path for child stderr.
+    pub stderr_path: Option<PathBuf>,
 }
 
 pub struct SystemProcessRunningTokio {
@@ -340,6 +346,8 @@ impl FxSystemCommand {
             pid_directory: None,
             #[cfg(target_os = "linux")]
             pin_to_cpus: None,
+            stdout_path: None,
+            stderr_path: None,
         }
     }
 
@@ -352,9 +360,8 @@ impl FxSystemCommand {
     ///
     /// Returns [`FxSysCommandError::PidNotFound`] when the pid cannot be found.
     ///
-    /// # Panics
-    ///
-    /// Panics if the process exists but has an empty command vector.
+    /// Returns [`FxSysCommandError::EmptyCommand`] when the process exists but
+    /// has an empty command vector.
     pub fn new_from_pid(pid: u32) -> Result<Self, FxSysCommandError> {
         let s = System::new_all();
         if let Some(process) = s.process(Pid::from_u32(pid)) {
@@ -371,6 +378,8 @@ impl FxSystemCommand {
                 pid_directory: None,
                 #[cfg(target_os = "linux")]
                 pin_to_cpus: None,
+                stdout_path: None,
+                stderr_path: None,
             })
         } else {
             Err(FxSysCommandError::PidNotFound(pid))
@@ -521,8 +530,22 @@ impl FxControl for FxSystemCommand {
                 let mut proc = tokio::process::Command::new(cmd);
                 proc.args(args);
 
-                proc.stderr(Stdio::null());
-                proc.stdout(Stdio::null());
+                match &self.stderr_path {
+                    Some(path) => {
+                        proc.stderr(Stdio::from(std::fs::File::create(path)?));
+                    }
+                    None => {
+                        proc.stderr(Stdio::null());
+                    }
+                }
+                match &self.stdout_path {
+                    Some(path) => {
+                        proc.stdout(Stdio::from(std::fs::File::create(path)?));
+                    }
+                    None => {
+                        proc.stdout(Stdio::null());
+                    }
+                }
                 proc.stdin(Stdio::null());
                 proc.kill_on_drop(false);
                 #[allow(unsafe_code)]
