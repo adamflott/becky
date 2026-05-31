@@ -88,19 +88,18 @@ impl NiceLevel {
     ///
     /// This maps to the lowest supported priority for the target platform:
     /// `19` on Linux and `20` on macOS.
-    ///
-    /// # Panics
-    ///
-    /// Panics with `unimplemented!` on platforms whose nice-level range is not
-    /// currently supported.
+    #[cfg(target_os = "linux")]
     pub fn lowest_priority() -> Self {
-        if cfg!(target_os = "linux") {
-            NiceLevel(19)
-        } else if cfg!(target_os = "macos") {
-            NiceLevel(20)
-        } else {
-            unimplemented!("nice level range not supported on this platform")
-        }
+        NiceLevel(19)
+    }
+
+    /// Returns the lowest priority nice level.
+    ///
+    /// This maps to the lowest supported priority for the target platform:
+    /// `19` on Linux and `20` on macOS.
+    #[cfg(target_os = "macos")]
+    pub fn lowest_priority() -> Self {
+        NiceLevel(20)
     }
 
     /// Returns the default process priority.
