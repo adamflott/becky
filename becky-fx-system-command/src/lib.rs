@@ -57,6 +57,10 @@ pub enum FxSysCommandError {
     #[error("{0}")]
     String(String),
 
+    /// The requested operation is not implemented by this provider.
+    #[error("unsupported operation: {0}")]
+    Unsupported(&'static str),
+
     /// The process id was not found in the process table.
     #[error("pid {0} not found")]
     PidNotFound(u32),
@@ -621,16 +625,16 @@ impl FxControl for FxSystemCommand {
     }
 
     type FxArchiveResult = ();
-    type FxArchiveError = ();
+    type FxArchiveError = FxSysCommandError;
 
     /// Archives the process effect.
     ///
-    /// Process checkpointing is not implemented yet, so this is currently a
-    /// no-op.
+    /// Process checkpointing is not implemented yet, so this returns
+    /// [`FxSysCommandError::Unsupported`].
     ///
     /// TODO - see if <https://github.com/checkpoint-restore/criu> can be used to archive a process
     async fn fx_archive(&self, _fnr: &mut Self::FxSpawnResult) -> Result<Self::FxArchiveResult, Self::FxArchiveError> {
-        Ok(())
+        Err(FxSysCommandError::Unsupported("system-command archive is not implemented"))
     }
 }
 
