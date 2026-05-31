@@ -1,6 +1,7 @@
 //! Boot method configuration for virtualized effects.
 
 use bon::Builder;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 // TODO put in in someplace for vms
@@ -15,7 +16,7 @@ pub struct BootMethodOptions {
 }
 
 /// Supported machine firmware boot methods.
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 pub enum BootMethod {
     /// BIOS or legacy boot.
     Bios,

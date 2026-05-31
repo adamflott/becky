@@ -5,11 +5,12 @@ use crate::metadata::MetadataManager;
 use crate::os::{OsImageFileType, SupportedOs};
 use bon::Builder;
 use bytesize::ByteSize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
 /// Disk image or block-device configuration for an effect.
-#[derive(Builder, Debug, Clone, Hash, Ord, PartialEq, Eq, PartialOrd)]
+#[derive(Builder, Debug, Clone, Hash, Ord, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
 pub struct StorageConfigurationDisk {
     /// Provider-local storage identifier.
     pub id: String,
@@ -22,7 +23,7 @@ pub struct StorageConfigurationDisk {
 }
 
 /// ISO image configuration for an effect.
-#[derive(Builder, Debug, Clone)]
+#[derive(Builder, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfigurationIso {
     /// Provider-local storage identifier.
     pub id: String,
@@ -33,7 +34,7 @@ pub struct StorageConfigurationIso {
 }
 
 /// Cloud image configuration for an effect.
-#[derive(Builder, Debug, Clone)]
+#[derive(Builder, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfigurationCloudImage {
     /// Provider-local image identifier.
     pub id: String,
@@ -46,14 +47,14 @@ pub struct StorageConfigurationCloudImage {
 }
 
 /// Network configuration for an effect.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkingConfiguration {
     /// User-mode networking.
     User,
 }
 
 /// Guest bootstrap mechanism.
-#[derive(Debug, Clone, clap::ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 pub enum BootStrapMethod {
     /// Use cloud-init metadata.
     CloudInit,

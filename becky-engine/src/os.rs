@@ -2,6 +2,7 @@
 
 use clap::ValueEnum;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -32,7 +33,7 @@ pub async fn download_file(url: &str, filename: &PathBuf) -> Result<(), Download
 }
 
 /// CPU architecture used by OS images.
-#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, clap::ValueEnum)]
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, clap::ValueEnum, Serialize, Deserialize)]
 pub enum Arch {
     /// AMD64/x86_64 architecture.
     Amd64,
@@ -64,25 +65,25 @@ impl Display for Arch {
 }
 
 /// Supported Debian image brands.
-#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub enum Debian {
     /// Debian 13 "Trixie".
     Trixie13,
 }
 
 /// Supported Alpine image brands.
-#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub enum Alpine {
     /// Alpine Linux 3.22.1.
     Version3_22_1,
 }
 
 /// Supported Red Hat image brands.
-#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub enum RedHat {}
 
 /// Supported OS image file formats.
-#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub enum OsImageFileType {
     /// ISO image.
     Iso,
@@ -103,7 +104,7 @@ impl Display for OsImageFileType {
 }
 
 /// Linux distribution variants supported by Becky.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinuxDistro {
     /// Debian Linux.
     Debian { arch: Arch, brand: Debian },
@@ -135,7 +136,7 @@ impl Display for SupportedLinuxDistroType {
 }
 
 /// Operating systems supported by Becky-managed images.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportedOs {
     /// Linux distributions.
     Linux(LinuxDistro),
