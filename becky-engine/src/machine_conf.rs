@@ -6,6 +6,7 @@ use crate::os::{OsImageFileType, SupportedOs};
 use bon::Builder;
 use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -75,9 +76,11 @@ pub trait FxResourceConstraints: Send + Sync + Debug {
     type FxStorageConfiguration: Send + Sync + Debug;
     /// Provider-specific full configuration type.
     type FxConfiguration: Send + Sync + Debug;
+    /// Error returned when metadata cannot be converted into provider config.
+    type FxConfigurationError: Send + Sync + Debug;
 
     /// Converts metadata into provider-specific effect configuration.
-    fn convert_from_metadata_to_fx_configuration(&self, mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()>;
+    fn convert_from_metadata_to_fx_configuration(&self, mdt: Self::Metadata) -> Result<Self::FxConfiguration, Self::FxConfigurationError>;
 
     /// Returns provider-specific storage configuration.
     fn storage_configurations(&self) -> Self::FxStorageConfiguration;
