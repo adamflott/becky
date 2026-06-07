@@ -38,6 +38,20 @@ pub trait FxControl: Send + Sync + Debug + FxAccounting {
         storage: &mut impl SysStorage,
     ) -> Result<Self::FxAllocateResult, Self::FxAllocateError>;
 
+    /// Bootstrap result type.
+    type FxBootstrapResult;
+    /// Bootstrap error type.
+    type FxBootstrapError;
+    /// Bootstraps fx, metadata, or storage resources required before start.
+    async fn fx_bootstrap<T: MetadataManager>(
+        &mut self,
+        host_id: &HostId,
+        fx_id: &FxId,
+        mdt: &mut T,
+        rc: &impl FxResourceConstraints,
+        storage: &mut impl SysStorage,
+    ) -> Result<Self::FxAllocateResult, Self::FxAllocateError>;
+
     /// Spawn/start result type, usually a process or provider handle.
     type FxSpawnResult;
     /// Spawn/start error type.
