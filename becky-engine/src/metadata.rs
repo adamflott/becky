@@ -1,8 +1,9 @@
 //! Metadata source, update, and image synchronization traits.
 
 use async_trait::async_trait;
+use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use becky_fx_id::FxId;
 
@@ -56,6 +57,51 @@ pub trait MetadataJobUpdate: MetadataUpdate {
     async fn metadata_fx_job_update(&mut self, host_id: &HostId, state: FxExecutionState, job_id: Self::MetadataUpdateResult);
 }
 
+/// Persists provider-specific effect inventory records.
+///
+/// This trait is intentionally generic over the record payload so metadata
+/// backends can store QEMU VMs, containers, process functions, or other effect
+/// kinds without the engine knowing their schemas. SQL implementations can
+/// serialize `record` into a JSON/BLOB column keyed by host, provider, and
+/// [`FxId`]; file implementations can write the same payload to provider
+/// directories.
+#[async_trait]
+pub trait MetadataInventory: Send + Sync {
+    /// Metadata inventory operation result type, often a revision identifier.
+    type MetadataInventoryResult: Send + Sync + Debug;
+    /// Metadata inventory operation error type.
+    type MetadataInventoryError: Send + Sync + Debug;
+
+    /// Inserts or replaces the provider-specific record for an effect.
+    async fn metadata_fx_record_upsert<T>(
+        &mut self,
+        host_id: &HostId,
+        provider: &str,
+        fxid: &FxId,
+        record: T,
+    ) -> Result<Self::MetadataInventoryResult, Self::MetadataInventoryError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + Debug;
+
+    /// Loads the provider-specific record for an effect.
+    async fn metadata_fx_record_get<T>(&mut self, host_id: &HostId, provider: &str, fxid: &FxId) -> Result<Option<T>, Self::MetadataInventoryError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + Debug;
+
+    /// Lists provider-specific records for a host/provider pair.
+    async fn metadata_fx_record_list<T>(&mut self, host_id: &HostId, provider: &str) -> Result<Vec<(FxId, T)>, Self::MetadataInventoryError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + Debug;
+
+    /// Deletes the provider-specific record for an effect.
+    async fn metadata_fx_record_delete(
+        &mut self,
+        host_id: &HostId,
+        provider: &str,
+        fxid: &FxId,
+    ) -> Result<Self::MetadataInventoryResult, Self::MetadataInventoryError>;
+}
+
 #[async_trait]
 /// Synchronizes operating-system images into a local cache.
 pub trait OsImage: Send + Sync {
@@ -72,4 +118,4 @@ pub trait OsImage: Send + Sync {
 }
 
 /// Composite trait for complete metadata backends.
-pub trait MetadataManager: MetadataSource + MetadataUpdate + MetadataJobUpdate + Sync + Send {}
+pub trait MetadataManager: MetadataSource + MetadataUpdate + MetadataJobUpdate + MetadataInventory + Sync + Send {}
