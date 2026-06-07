@@ -91,24 +91,9 @@ impl FxResourceConstraints for ResourceConstraintless {
     type Metadata = Metadataless;
     type FxStorageConfiguration = ();
     type FxConfiguration = ();
+    type FxConfigurationError = Infallible;
 
-    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()> {
-        Ok(())
-    }
-
-    fn storage_configurations(&self) -> Self::FxStorageConfiguration {}
-}
-
-/// Placeholder resource request for QEMU-backed virtual machines.
-#[derive(Debug)]
-pub struct QemuVMRequest {}
-
-impl FxResourceConstraints for QemuVMRequest {
-    type Metadata = Metadataless;
-    type FxStorageConfiguration = ();
-    type FxConfiguration = ();
-
-    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()> {
+    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, Self::FxConfigurationError> {
         Ok(())
     }
 
