@@ -16,6 +16,8 @@ becky-fx-id = { version = "*", path = "../becky-fx-id" }
 becky-fx-system-command = { version = "*", path = "../becky-fx-system-command" }
 becky-utils = { version = "*", path = "../becky-utils"}
 bon = { workspace = true}
+bytesize = { workspace = true }
+clap = { workspace = true }
 futures = { workspace = true}
 libc = {workspace = true}
 libproc = { workspace = true}

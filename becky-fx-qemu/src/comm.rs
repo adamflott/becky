@@ -1,6 +1,5 @@
 use crate::SpawnError;
 use crate::handle::QemuHandle;
-use crate::instance::{QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS, QEMU_WAIT_UDS_TIMEOUT_SECS};
 use becky_utils::get_process;
 use futures::StreamExt;
 use qapi::futures::{QapiEvents, QapiService, QgaStreamTokio, QmpStreamTokio};
@@ -15,6 +14,8 @@ use tracing::{debug, error, info, warn};
 
 pub async fn try_connect_ctl_socket(
     path_socket_ctl: &PathBuf,
+    timeout_secs: u64,
+    retry_interval_millis: u64,
 ) -> Result<
     (
         QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
@@ -24,11 +25,11 @@ pub async fn try_connect_ctl_socket(
 > {
     debug!(
         "qemu:qmp:socket waiting up to {} seconds for control socket at {} to be available...",
-        QEMU_WAIT_UDS_TIMEOUT_SECS,
+        timeout_secs,
         &path_socket_ctl.as_path().display(),
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(QEMU_WAIT_UDS_TIMEOUT_SECS), async {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
         loop {
             match qapi::futures::QmpStreamTokio::open_uds(path_socket_ctl).await {
                 Ok(stream) => {
@@ -41,18 +42,18 @@ pub async fn try_connect_ctl_socket(
                         Err(negotiate_err) => {
                             warn!(
                                 "qemu:qmp:socket negotiate failed with error:{}, trying again after {} milliseconds",
-                                negotiate_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS
+                                negotiate_err, retry_interval_millis
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(retry_interval_millis)).await;
                         }
                     }
                 }
                 Err(open_uds_err) => {
                     warn!(
                         "qemu:qmp:socket open_uds() failed with error:{}, trying again after {} milliseconds",
-                        open_uds_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS
+                        open_uds_err, retry_interval_millis
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_interval_millis)).await;
                 }
             }
         }
@@ -99,17 +100,23 @@ pub async fn try_monitor_qemu_with_api(
         schema,
         event_reader,
         ga: None,
+        ga_info: None,
+        ga_task: None,
     })
 }
 
-pub async fn try_connect_ga_socket(path_socket_ga: &PathBuf) -> Result<(QapiService<QgaStreamTokio<WriteHalf<UnixStream>>>, JoinHandle<()>), Elapsed> {
+pub async fn try_connect_ga_socket(
+    path_socket_ga: &PathBuf,
+    timeout_secs: u64,
+    retry_interval_millis: u64,
+) -> Result<(QapiService<QgaStreamTokio<WriteHalf<UnixStream>>>, JoinHandle<()>), Elapsed> {
     debug!(
         "qemu:qga:socket waiting up to {} seconds for guest agent socket at {} to be available...",
-        QEMU_WAIT_UDS_TIMEOUT_SECS,
+        timeout_secs,
         &path_socket_ga.as_path().display(),
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(QEMU_WAIT_UDS_TIMEOUT_SECS), async {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
         loop {
             match qapi::futures::QgaStreamTokio::open_uds(path_socket_ga).await {
                 Ok(stream) => {
@@ -120,9 +127,9 @@ pub async fn try_connect_ga_socket(path_socket_ga: &PathBuf) -> Result<(QapiServ
                 Err(open_err) => {
                     warn!(
                         "qemu:qga:open_uds failed with error:{}, trying again after {} milliseconds",
-                        open_err, QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS,
+                        open_err, retry_interval_millis,
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(QEMU_WAIT_TIME_FOR_UDS_AVAILABLE_MS)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_interval_millis)).await;
                 }
             }
         }

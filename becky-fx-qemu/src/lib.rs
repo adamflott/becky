@@ -12,8 +12,11 @@ use async_trait::async_trait;
 use becky_engine::boot_methods::BootMethod;
 use becky_engine::empy_implementations::Metadataless;
 use becky_engine::host_id::HostId;
-use becky_engine::machine_conf::{BootStrapMethod, FxResourceConstraints, NetworkingConfiguration, StorageConfigurationDisk, StorageConfigurationIso};
+use becky_engine::machine_conf::{
+    BootStrapMethod, FxResourceConstraints, NetworkingConfiguration, StorageConfigurationCloudImage, StorageConfigurationDisk, StorageConfigurationIso,
+};
 use becky_engine::metadata::MetadataManager;
+use becky_engine::os::OsImageFileType;
 use becky_engine::storage::{StorageResizeRequest, StorageResizeRequestDirection, SysStorage};
 use becky_engine::sys_conf::SystemConfiguration;
 use becky_fx_id::FxId;
@@ -25,17 +28,23 @@ use qemu_command_builder::args::memory::{Memory, MemoryUnit};
 use qemu_command_builder::common::AccelType;
 use qemu_command_builder::to_command::ToCommand;
 use qemu_command_builder::{QemuCommand, QemuInstanceForAarch64, QemuInstanceForX86_64};
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::env::JoinPathsError;
 use std::fmt::Debug;
 use std::num::ParseIntError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 use tracing::{error, info};
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+
 /// QEMU binary name for image utility
 const QEMU_BIN_IMG: &str = "qemu-img";
+pub const QEMU_METADATA_PROVIDER: &str = "becky-fx-qemu";
 
 /// filename where to put the process id for the `-pidfile` QEMU command line argument, lives under `<vm-root>/<fx-id>/run/qemu.pid`
 const QEMU_PID_FILENAME: &str = "qemu.pid";
@@ -51,6 +60,69 @@ pub struct QemuCommonOptions {
     pub boot_kernel: bool, // ???
     pub accel_type: AccelType,
     pub bootstrap_method: BootStrapMethod,
+    pub qmp_connect_timeout_secs: u64,
+    pub qga_connect_timeout_secs: u64,
+    pub uds_retry_interval_millis: u64,
+    pub qga_command_timeout_secs: u64,
+    pub status_poll_interval_secs: u64,
+    pub archive_policy: QemuArchivePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QemuArchivePolicy {
+    StateOnly,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QemuDesiredArchitecture {
+    X86_64,
+    Aarch64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QemuDesiredCommonOptions {
+    pub memory: String,
+    pub enable_guest_agent: bool,
+    pub kernel: Option<PathBuf>,
+    pub initrd: Option<PathBuf>,
+    pub extra_options: Vec<String>,
+    pub snapshot: Option<bool>,
+    pub boot_kernel: bool,
+    pub accel_type: String,
+    pub bootstrap_method: BootStrapMethod,
+    pub qmp_connect_timeout_secs: u64,
+    pub qga_connect_timeout_secs: u64,
+    pub uds_retry_interval_millis: u64,
+    pub qga_command_timeout_secs: u64,
+    pub status_poll_interval_secs: u64,
+    pub archive_policy: QemuArchivePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QemuDesiredMetadataRecord {
+    pub name: String,
+    pub arch: QemuDesiredArchitecture,
+    pub common: QemuDesiredCommonOptions,
+    pub cpus: u64,
+    pub boot_method: Option<BootMethod>,
+    pub storage: Vec<QemuStorageType>,
+    pub networking: Option<NetworkingConfiguration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QemuMetadataRecord {
+    pub name: String,
+    pub command_line: String,
+    #[serde(default)]
+    pub desired: Option<QemuDesiredMetadataRecord>,
+    pub runtime_pid: Option<u32>,
+    pub guest_agent_enabled: bool,
+    pub pidfile: PathBuf,
+    pub qmp_socket: PathBuf,
+    pub qga_socket: Option<PathBuf>,
+    pub log_dir: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 /// QEMU-specific Configuration for the desired VM.
@@ -76,25 +148,25 @@ pub enum QemuMachineConfigurationByArch {
     Aarch64(QemuMachineConfigurationAarch64),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QemuQcowFormat {
     Raw,
     Qcow2,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QemuStorageType {
     // file backed
     Qcow2(Vec<(StorageConfigurationDisk, QemuQcowFormat, QcowOptions)>),
     // host block dev
-    HostBlock,
+    HostBlock(Vec<StorageConfigurationDisk>),
     //Network,
     // TODO
     //CopyOnWrite,
     //InMemory,
     //DevicePassthrough,
     Iso(Vec<StorageConfigurationIso>),
-    CloudImage,
+    CloudImage(Vec<(StorageConfigurationCloudImage, QcowOptions)>),
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +213,21 @@ fn qemu_disk_path(system_configuration: &SystemConfiguration, fx_id: &FxId, prop
     filename
 }
 
+fn qemu_disk_format_arg(format: &QemuQcowFormat) -> &'static str {
+    match format {
+        QemuQcowFormat::Raw => QEMU_IMG_FORMAT_RAW,
+        QemuQcowFormat::Qcow2 => QEMU_IMG_FORMAT_QCOW2,
+    }
+}
+
+fn os_image_format_arg(format: &OsImageFileType) -> Option<&'static str> {
+    match format {
+        OsImageFileType::Iso => None,
+        OsImageFileType::Qcow2 => Some(QEMU_IMG_FORMAT_QCOW2),
+        OsImageFileType::Raw => Some(QEMU_IMG_FORMAT_RAW),
+    }
+}
+
 fn iso_dest_path(system_configuration: &SystemConfiguration, fx_id: &FxId, iso: &StorageConfigurationIso) -> PathBuf {
     let name = if !iso.id.is_empty() {
         sanitize_storage_name(&iso.id)
@@ -154,6 +241,98 @@ fn iso_dest_path(system_configuration: &SystemConfiguration, fx_id: &FxId, iso: 
     let mut dest = vm_data_dir(system_configuration, fx_id);
     dest.push(name);
     dest
+}
+
+fn cloud_image_stem(image: &StorageConfigurationCloudImage) -> String {
+    if !image.id.is_empty() {
+        sanitize_storage_name(&image.id)
+    } else {
+        image
+            .path
+            .file_stem()
+            .map(|name| sanitize_storage_name(&name.to_string_lossy()))
+            .unwrap_or_else(|| "cloud-image".to_string())
+    }
+}
+
+fn cloud_image_overlay_path(system_configuration: &SystemConfiguration, fx_id: &FxId, image: &StorageConfigurationCloudImage) -> PathBuf {
+    let mut dest = vm_data_dir(system_configuration, fx_id);
+    dest.push(format!("{}.{}", cloud_image_stem(image), QEMU_IMG_FILE_EXT_QCOW2));
+    dest
+}
+
+async fn inspect_qemu_image(filename: &Path) -> Result<QemuImgInfo, QemuStorageCreateError> {
+    let filename_arg = filename.display().to_string();
+    let cmd = run_system_command(
+        QEMU_BIN_IMG,
+        vec!["info", "--force-share", "--output", "json", filename_arg.as_str()],
+        CommandOptions::default(),
+    )
+    .await?;
+
+    Ok(serde_json::from_slice::<QemuImgInfo>(cmd.output.stdout.as_slice())?)
+}
+
+async fn qemu_img_create(fmt: &str, filename: &Path, size: Option<u64>, opts: &QcowOptions) -> Result<(), QemuStorageCreateError> {
+    let filename_arg = filename.display().to_string();
+    let size_arg = size.map(|size| size.to_string());
+    let create_options = opts.create_options();
+    let create_options_arg = create_options.join(",");
+
+    let mut args = vec!["create".to_string(), "--format".to_string(), fmt.to_string()];
+    if !create_options_arg.is_empty() {
+        args.push("-o".to_string());
+        args.push(create_options_arg);
+    }
+    args.push(filename_arg);
+    if let Some(size_arg) = &size_arg {
+        args.push(size_arg.clone());
+    }
+
+    let borrowed_args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_system_command(QEMU_BIN_IMG, borrowed_args, CommandOptions::default()).await?;
+    Ok(())
+}
+
+async fn validate_host_block_device(path: &Path) -> Result<(), QemuStorageCreateError> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            QemuStorageCreateError::FileNotFound(path.to_path_buf())
+        } else {
+            QemuStorageCreateError::IO(err)
+        }
+    })?;
+
+    #[cfg(unix)]
+    {
+        if metadata.file_type().is_block_device() {
+            Ok(())
+        } else {
+            Err(QemuStorageCreateError::UnsupportedStorage("host block storage path is not a block device"))
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(QemuStorageCreateError::UnsupportedStorage(
+            "host block storage validation is only implemented on Unix hosts",
+        ))
+    }
+}
+
+async fn qemu_img_resize(filename: &Path, size: u64, shrink: bool) -> Result<(), QemuStorageCreateError> {
+    let filename_arg = filename.display().to_string();
+    let size_arg = size.to_string();
+    let mut args = vec!["resize"];
+    if shrink {
+        args.push("--shrink");
+    }
+    args.push(filename_arg.as_str());
+    args.push(size_arg.as_str());
+
+    run_system_command(QEMU_BIN_IMG, args, CommandOptions::default()).await?;
+    Ok(())
 }
 
 /// QEMU-specific resource request accepted by [`manager::QemuManager`].
@@ -201,7 +380,7 @@ impl FxResourceConstraints for QemuMachineRequest {
     type FxConfiguration = QemuMachineRequest;
     type FxConfigurationError = ();
 
-    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()> {
+    fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, Self::FxConfigurationError> {
         Ok(self.clone())
     }
 
@@ -233,6 +412,12 @@ pub fn default_common_options() -> QemuCommonOptions {
         boot_kernel: false,
         accel_type: AccelType::Tcg,
         bootstrap_method: BootStrapMethod::None,
+        qmp_connect_timeout_secs: 3,
+        qga_connect_timeout_secs: 3,
+        uds_retry_interval_millis: 100,
+        qga_command_timeout_secs: 3,
+        status_poll_interval_secs: 10,
+        archive_policy: QemuArchivePolicy::StateOnly,
     }
 }
 
@@ -274,32 +459,22 @@ impl SysStorage for QemuMachineConfiguration {
                     for (props, format, _opts) in files {
                         let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
 
-                        match run_system_command(
-                            QEMU_BIN_IMG,
-                            vec!["info", "--force-share", "--output", "json", filename.display().to_string().as_str()],
-                            CommandOptions::default(),
-                        )
-                        .await
-                        {
-                            Ok(cmd) => match serde_json::from_slice::<QemuImgInfo>(cmd.output.stdout.as_slice()) {
-                                Ok(img) => match img.format_specific {
-                                    None => {}
-                                    Some(fmt) => {
-                                        if fmt.data.corrupt {
-                                            errors.push(QemuStorageCreateError::CorruptImage(filename.clone()));
-                                        }
-                                    }
-                                },
-                                Err(json_parse_err) => {
-                                    errors.push(QemuStorageCreateError::JsonParse(json_parse_err));
+                        match inspect_qemu_image(&filename).await {
+                            Ok(img) => {
+                                if img.is_corrupt() {
+                                    errors.push(QemuStorageCreateError::CorruptImage(filename.clone()));
                                 }
-                            },
-                            Err(cmd_err) => errors.push(QemuStorageCreateError::CommandRanError(cmd_err)),
+                            }
+                            Err(err) => errors.push(err),
                         }
                     }
                 }
-                QemuStorageType::HostBlock => {
-                    errors.push(QemuStorageCreateError::UnsupportedStorage("host block storage is not implemented"));
+                QemuStorageType::HostBlock(devices) => {
+                    for device in devices {
+                        if let Err(err) = validate_host_block_device(&device.path).await {
+                            errors.push(err);
+                        }
+                    }
                 }
                 QemuStorageType::Iso(isos) => {
                     for iso in isos {
@@ -316,8 +491,32 @@ impl SysStorage for QemuMachineConfiguration {
                         }
                     }
                 }
-                QemuStorageType::CloudImage => {
-                    errors.push(QemuStorageCreateError::UnsupportedStorage("cloud image storage is not implemented"));
+                QemuStorageType::CloudImage(images) => {
+                    for (image, _opts) in images {
+                        let filename = cloud_image_overlay_path(&self.system_configuration, fx_id, image);
+                        let inspect_path = match tokio::fs::try_exists(&filename).await {
+                            Ok(true) => filename,
+                            Ok(false) => image.path.clone(),
+                            Err(err) => {
+                                errors.push(QemuStorageCreateError::IO(err));
+                                continue;
+                            }
+                        };
+
+                        if os_image_format_arg(&image.os_type).is_none() {
+                            errors.push(QemuStorageCreateError::UnsupportedStorage("ISO cloud images cannot be used as writable disks"));
+                            continue;
+                        }
+
+                        match inspect_qemu_image(&inspect_path).await {
+                            Ok(img) => {
+                                if img.is_corrupt() {
+                                    errors.push(QemuStorageCreateError::CorruptImage(inspect_path));
+                                }
+                            }
+                            Err(err) => errors.push(err),
+                        }
+                    }
                 }
             }
         }
@@ -352,7 +551,7 @@ impl SysStorage for QemuMachineConfiguration {
         for storage in &self.storage {
             match storage {
                 QemuStorageType::Qcow2(files) => {
-                    for (props, format, _opts) in files {
+                    for (props, format, opts) in files {
                         let data_dir = vm_data_dir(&self.system_configuration, fx_id);
 
                         if let Err(err) = tokio::fs::create_dir_all(&data_dir).await {
@@ -360,11 +559,7 @@ impl SysStorage for QemuMachineConfiguration {
                             continue;
                         }
 
-                        let fmt = match format {
-                            QemuQcowFormat::Raw => QEMU_IMG_FORMAT_RAW,
-                            QemuQcowFormat::Qcow2 => QEMU_IMG_FORMAT_QCOW2,
-                        };
-
+                        let fmt = qemu_disk_format_arg(format);
                         let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
 
                         match tokio::fs::try_exists(&filename).await {
@@ -373,28 +568,22 @@ impl SysStorage for QemuMachineConfiguration {
                                     errors.push(corrupt_err);
                                 }
                             }
-                            Ok(false) => {
-                                let filename_arg = filename.display().to_string();
-                                let size_arg = props.size.as_u64().to_string();
-                                match run_system_command(
-                                    QEMU_BIN_IMG,
-                                    vec!["create", "--format", fmt, filename_arg.as_str(), size_arg.as_str()],
-                                    CommandOptions::default(),
-                                )
-                                .await
-                                {
-                                    Ok(_created) => {}
-                                    Err(cmd_err) => {
-                                        errors.push(QemuStorageCreateError::CommandRanError(cmd_err));
-                                    }
+                            Ok(false) => match qemu_img_create(fmt, &filename, Some(props.size.as_u64()), opts).await {
+                                Ok(_created) => {}
+                                Err(cmd_err) => {
+                                    errors.push(cmd_err);
                                 }
-                            }
+                            },
                             Err(err) => errors.push(QemuStorageCreateError::IO(err)),
                         }
                     }
                 }
-                QemuStorageType::HostBlock => {
-                    errors.push(QemuStorageCreateError::UnsupportedStorage("host block storage is not implemented"));
+                QemuStorageType::HostBlock(devices) => {
+                    for device in devices {
+                        if let Err(err) = validate_host_block_device(&device.path).await {
+                            errors.push(err);
+                        }
+                    }
                 }
                 QemuStorageType::Iso(isos) => {
                     for iso in isos {
@@ -420,8 +609,54 @@ impl SysStorage for QemuMachineConfiguration {
                         }
                     }
                 }
-                QemuStorageType::CloudImage => {
-                    errors.push(QemuStorageCreateError::UnsupportedStorage("cloud image storage is not implemented"));
+                QemuStorageType::CloudImage(images) => {
+                    for (image, opts) in images {
+                        let Some(backing_format) = os_image_format_arg(&image.os_type) else {
+                            errors.push(QemuStorageCreateError::UnsupportedStorage("ISO cloud images cannot be used as writable disks"));
+                            continue;
+                        };
+
+                        match tokio::fs::try_exists(&image.path).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                errors.push(QemuStorageCreateError::FileNotFound(image.path.clone()));
+                                continue;
+                            }
+                            Err(err) => {
+                                errors.push(QemuStorageCreateError::IO(err));
+                                continue;
+                            }
+                        }
+
+                        let data_dir = vm_data_dir(&self.system_configuration, fx_id);
+                        if let Err(err) = tokio::fs::create_dir_all(&data_dir).await {
+                            errors.push(QemuStorageCreateError::IO(err));
+                            continue;
+                        }
+
+                        let filename = cloud_image_overlay_path(&self.system_configuration, fx_id, image);
+                        match tokio::fs::try_exists(&filename).await {
+                            Ok(true) => {
+                                if let Err(corrupt_err) = is_qcow_image_corrupt(&filename).await {
+                                    errors.push(corrupt_err);
+                                }
+                            }
+                            Ok(false) => {
+                                let mut create_opts = opts.clone();
+                                if create_opts.backing_file.is_none() {
+                                    create_opts.backing_file = Some(image.path.clone());
+                                }
+                                if create_opts.backing_format.is_none() {
+                                    create_opts.backing_format = Some(backing_format.to_string());
+                                }
+
+                                if let Err(err) = qemu_img_create(QEMU_IMG_FORMAT_QCOW2, &filename, None, &create_opts).await {
+                                    errors.push(err);
+                                }
+                            }
+                            Err(err) => errors.push(QemuStorageCreateError::IO(err)),
+                        }
+                    }
                 }
             }
         }
@@ -429,29 +664,29 @@ impl SysStorage for QemuMachineConfiguration {
     }
 
     type SysStorageOpenResult = ();
-    type SysStorageOpenError = ();
+    type SysStorageOpenError = Vec<QemuStorageCreateError>;
 
     async fn sys_storage_open<T: MetadataManager + Send + Sync>(
         &mut self,
-        _host_id: &HostId,
-        _mdm: &mut T,
-        _fx_id: &FxId,
-        _rc: impl FxResourceConstraints,
+        host_id: &HostId,
+        mdm: &mut T,
+        fx_id: &FxId,
+        rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageOpenResult, Self::SysStorageOpenError> {
-        Ok(())
+        self.sys_storage_check(host_id, mdm, fx_id, rc).await
     }
 
     type SysStorageCloseResult = ();
-    type SysStorageCloseError = ();
+    type SysStorageCloseError = Vec<QemuStorageCreateError>;
 
     async fn sys_storage_close<T: MetadataManager + Send + Sync>(
         &mut self,
-        _host_id: &HostId,
-        _mdm: &mut T,
-        _fx_id: &FxId,
-        _rc: impl FxResourceConstraints,
+        host_id: &HostId,
+        mdm: &mut T,
+        fx_id: &FxId,
+        rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageCloseResult, Self::SysStorageCloseError> {
-        Ok(())
+        self.sys_storage_check(host_id, mdm, fx_id, rc).await
     }
 
     type SysStorageResizeResult = ();
@@ -470,25 +705,53 @@ impl SysStorage for QemuMachineConfiguration {
         for request in resize_requests {
             let mut found = false;
             for storage in &self.storage {
-                if let QemuStorageType::Qcow2(files) = storage {
-                    for (props, format, _opts) in files {
-                        if props.id != request.filepath.id {
-                            continue;
-                        }
+                match storage {
+                    QemuStorageType::Qcow2(files) => {
+                        for (props, format, _opts) in files {
+                            if props.id != request.filepath.id {
+                                continue;
+                            }
 
-                        found = true;
-                        let filename = qemu_disk_path(&self.system_configuration, fx_id, props, format);
-                        let filename_arg = filename.display().to_string();
-                        let size_arg = request.new_size.as_u64().to_string();
-                        let mut args = vec!["resize"];
-                        if matches!(request.dir, StorageResizeRequestDirection::Shrink) {
-                            args.push("--shrink");
+                            found = true;
+                            if let Err(err) = qemu_img_resize(
+                                &qemu_disk_path(&self.system_configuration, fx_id, props, format),
+                                request.new_size.as_u64(),
+                                matches!(request.dir, StorageResizeRequestDirection::Shrink),
+                            )
+                            .await
+                            {
+                                errors.push(err);
+                            }
                         }
-                        args.push(filename_arg.as_str());
-                        args.push(size_arg.as_str());
+                    }
+                    QemuStorageType::HostBlock(devices) => {
+                        if devices.iter().any(|device| device.id == request.filepath.id) {
+                            found = true;
+                            errors.push(QemuStorageCreateError::UnsupportedStorage("host block storage cannot be resized by qemu-img"));
+                        }
+                    }
+                    QemuStorageType::Iso(isos) => {
+                        if isos.iter().any(|iso| iso.id == request.filepath.id) {
+                            found = true;
+                            errors.push(QemuStorageCreateError::UnsupportedStorage("ISO storage cannot be resized"));
+                        }
+                    }
+                    QemuStorageType::CloudImage(images) => {
+                        for (image, _opts) in images {
+                            if image.id != request.filepath.id {
+                                continue;
+                            }
 
-                        if let Err(err) = run_system_command(QEMU_BIN_IMG, args, CommandOptions::default()).await {
-                            errors.push(QemuStorageCreateError::CommandRanError(err));
+                            found = true;
+                            if let Err(err) = qemu_img_resize(
+                                &cloud_image_overlay_path(&self.system_configuration, fx_id, image),
+                                request.new_size.as_u64(),
+                                matches!(request.dir, StorageResizeRequestDirection::Shrink),
+                            )
+                            .await
+                            {
+                                errors.push(err);
+                            }
                         }
                     }
                 }
@@ -539,6 +802,13 @@ impl FromStr for QemuSupportedArch {
 #[derive(Clone, Debug)]
 pub enum WorkerEvent {
     Panic,
+    Watchdog,
+    BlockIoError,
+    BlockImageCorrupted,
+    DeviceDeleted,
+    DeviceUnplugGuestError,
+    Migration,
+    MemoryFailure,
     Shutdown,
     Suspend,
     Resume,
@@ -576,19 +846,28 @@ pub enum WorkerCommand {
 
 #[derive(Error, Debug)]
 pub enum CreateError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("config: {0}")]
     Config(String),
 
-    #[error("todo {0}")]
+    #[error("metadata: {0}")]
+    Metadata(String),
+
+    #[error("qemu command parse: {0}")]
+    ParseQemuCommand(String),
+
+    #[error("process lookup failed: {0}")]
     GetProc(String),
 
-    #[error("todo {0}")]
+    #[error("pid parse failed: {0}")]
     ParsePid(#[from] ParseIntError),
 
-    #[error("todo {0}")]
+    #[error("path list join failed: {0}")]
     JoinPaths(#[from] JoinPathsError),
 
-    #[error("todo {0}")]
+    #[error("qemu binary lookup failed: {0}")]
     Which(#[from] which::Error),
 
     #[error("verify")]
@@ -599,6 +878,24 @@ pub enum CreateError {
 
     #[error("alloc")]
     Allocate(#[from] AllocateError),
+}
+
+#[derive(Error, Debug)]
+pub enum QemuManagerStopError {
+    #[error("qemu vm is not managed: {0}")]
+    NotFound(FxId),
+
+    #[error("worker command send failed: {0}")]
+    Send(String),
+
+    #[error("qemu vm {fx_id} pid {pid} did not exit within {timeout_secs} seconds")]
+    Timeout { fx_id: FxId, pid: u32, timeout_secs: u64 },
+
+    #[error("worker join failed: {0}")]
+    Join(String),
+
+    #[error("metadata update failed: {0}")]
+    Metadata(String),
 }
 
 #[derive(Error, Debug)]
@@ -623,6 +920,12 @@ pub enum CallApiError {
 
     #[error("qemu call failed with error code {0}")]
     Timeout(#[from] Elapsed),
+
+    #[error("unsupported qmp command: {0}")]
+    UnsupportedCommand(&'static str),
+
+    #[error("unsupported qga command: {0}")]
+    UnsupportedGuestAgentCommand(&'static str),
 
     #[error("qemu call failed with error code")]
     NoGaAvailable,
@@ -656,6 +959,9 @@ pub enum ArchiveError {
 
     #[error("api")]
     CallApiError(#[from] CallApiError),
+
+    #[error("unsupported archive policy: {0}")]
+    UnsupportedPolicy(&'static str),
 }
 
 #[derive(Error, Debug)]
@@ -713,4 +1019,63 @@ pub enum AllocateError {
 
     #[error("db")]
     Db,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use becky_engine::empy_implementations::Metadataless;
+    use becky_engine::host_id::HostId;
+    use becky_engine::machine_conf::StorageConfigurationDisk;
+    use becky_engine::storage::{StorageResizeRequest, StorageResizeRequestDirection, SysStorage};
+    use bytesize::ByteSize;
+
+    #[test]
+    fn default_common_options_include_runtime_timeouts() {
+        let opts = default_common_options();
+
+        assert_eq!(opts.qmp_connect_timeout_secs, 3);
+        assert_eq!(opts.qga_connect_timeout_secs, 3);
+        assert_eq!(opts.uds_retry_interval_millis, 100);
+        assert_eq!(opts.qga_command_timeout_secs, 3);
+        assert_eq!(opts.status_poll_interval_secs, 10);
+    }
+
+    #[tokio::test]
+    async fn host_block_resize_reports_unsupported_storage() {
+        let disk = StorageConfigurationDisk {
+            id: "host-disk".to_string(),
+            path: PathBuf::from("/dev/not-real"),
+            size: ByteSize::b(0),
+            bootable: false,
+        };
+        let mut storage = QemuMachineConfiguration {
+            name: "test".to_string(),
+            system_configuration: SystemConfiguration::default(),
+            conf: default_machine_configuration_by_host(default_common_options()),
+            storage: vec![QemuStorageType::HostBlock(vec![disk.clone()])],
+            networking: None,
+        };
+        let mut metadata = Metadataless {};
+
+        let result = storage
+            .sys_storage_resize(
+                &HostId::String("host".to_string()),
+                &mut metadata,
+                &FxId::String("fx".to_string()),
+                QemuMachineRequest::default_for_host(),
+                vec![StorageResizeRequest {
+                    filepath: disk,
+                    new_size: ByteSize::b(1024),
+                    dir: StorageResizeRequestDirection::Grow,
+                }],
+            )
+            .await;
+
+        let errors = match result {
+            Ok(()) => panic!("host block resize should be unsupported"),
+            Err(errors) => errors,
+        };
+        assert!(matches!(errors.first(), Some(QemuStorageCreateError::UnsupportedStorage(message)) if message.contains("host block")));
+    }
 }

@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use becky_fx_id::FxId;
 use bytesize::ByteSize;
 use std::fmt::Debug;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 use crate::host_id::HostId;
 use crate::machine_conf::{FxResourceConstraints, StorageConfigurationDisk};
@@ -26,6 +28,45 @@ pub struct StorageResizeRequest {
     pub new_size: ByteSize,
     /// Resize direction.
     pub dir: StorageResizeRequestDirection,
+}
+
+/// Errors returned by the basic filesystem storage backend.
+#[derive(Debug, Error)]
+pub enum StorageFilesystemError {
+    /// Filesystem operation failed.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A required directory was not present.
+    #[error("directory not found: {0}")]
+    DirectoryNotFound(PathBuf),
+
+    /// The operation is not supported by the filesystem backend.
+    #[error("unsupported storage operation: {0}")]
+    Unsupported(&'static str),
+}
+
+async fn ensure_dir(path: &Path) -> Result<(), StorageFilesystemError> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            StorageFilesystemError::DirectoryNotFound(path.to_path_buf())
+        } else {
+            StorageFilesystemError::Io(err)
+        }
+    })?;
+
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(StorageFilesystemError::Unsupported("configured storage path exists but is not a directory"))
+    }
+}
+
+async fn ensure_system_dirs(sys_conf: &SystemConfiguration) -> Result<(), StorageFilesystemError> {
+    ensure_dir(&sys_conf.os_cache_root_path).await?;
+    ensure_dir(&sys_conf.vm_root_path).await?;
+    ensure_dir(&sys_conf.vm_data_root_path).await?;
+    ensure_dir(&sys_conf.run_path).await
 }
 
 #[async_trait]
@@ -202,13 +243,36 @@ impl SysStorage for Storageless {
     }
 }
 
-/// Filesystem-backed storage backend that creates Becky working directories.
-pub struct StorageFilesystem {}
+/// Filesystem-backed storage backend that creates and validates Becky working directories.
+#[derive(Clone, Debug, Default)]
+pub struct StorageFilesystem {
+    /// Optional configuration used by info/check/open/close calls that do not
+    /// receive a `SystemConfiguration` argument directly.
+    pub system_configuration: Option<SystemConfiguration>,
+}
+
+impl StorageFilesystem {
+    /// Creates a filesystem storage backend bound to a system configuration.
+    pub fn new(system_configuration: SystemConfiguration) -> Self {
+        Self {
+            system_configuration: Some(system_configuration),
+        }
+    }
+
+    async fn validate_bound_configuration(&self) -> Result<(), StorageFilesystemError> {
+        match &self.system_configuration {
+            Some(sys_conf) => ensure_system_dirs(sys_conf).await,
+            None => Err(StorageFilesystemError::Unsupported(
+                "StorageFilesystem has no bound SystemConfiguration for this lifecycle method",
+            )),
+        }
+    }
+}
 
 #[async_trait]
 impl SysStorage for StorageFilesystem {
     type SysStorageInfoResult = ();
-    type SysStorageInfoError = ();
+    type SysStorageInfoError = StorageFilesystemError;
 
     async fn sys_storage_info<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -217,11 +281,11 @@ impl SysStorage for StorageFilesystem {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageInfoResult, Self::SysStorageInfoError> {
-        Ok(())
+        self.validate_bound_configuration().await
     }
 
     type SysStorageCheckResult = ();
-    type SysStorageCheckError = ();
+    type SysStorageCheckError = StorageFilesystemError;
 
     async fn sys_storage_check<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -230,11 +294,11 @@ impl SysStorage for StorageFilesystem {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageCheckResult, Self::SysStorageCheckError> {
-        Ok(())
+        self.validate_bound_configuration().await
     }
 
     type SysStorageCreateResult = ();
-    type SysStorageCreateError = std::io::Error;
+    type SysStorageCreateError = StorageFilesystemError;
 
     async fn sys_storage_create<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -246,12 +310,15 @@ impl SysStorage for StorageFilesystem {
     ) -> Result<Self::SysStorageCreateResult, Self::SysStorageCreateError> {
         tokio::fs::create_dir_all(&sys_conf.os_cache_root_path).await?;
         tokio::fs::create_dir_all(&sys_conf.vm_root_path).await?;
+        tokio::fs::create_dir_all(&sys_conf.vm_data_root_path).await?;
         tokio::fs::create_dir_all(&sys_conf.run_path).await?;
+        ensure_system_dirs(sys_conf).await?;
+        self.system_configuration = Some(sys_conf.clone());
         Ok(())
     }
 
     type SysStorageOpenResult = ();
-    type SysStorageOpenError = ();
+    type SysStorageOpenError = StorageFilesystemError;
 
     async fn sys_storage_open<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -260,11 +327,11 @@ impl SysStorage for StorageFilesystem {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageOpenResult, Self::SysStorageOpenError> {
-        Ok(())
+        self.validate_bound_configuration().await
     }
 
     type SysStorageCloseResult = ();
-    type SysStorageCloseError = ();
+    type SysStorageCloseError = StorageFilesystemError;
 
     async fn sys_storage_close<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -273,11 +340,11 @@ impl SysStorage for StorageFilesystem {
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
     ) -> Result<Self::SysStorageCloseResult, Self::SysStorageCloseError> {
-        Ok(())
+        self.validate_bound_configuration().await
     }
 
     type SysStorageResizeResult = ();
-    type SysStorageResizeError = ();
+    type SysStorageResizeError = StorageFilesystemError;
 
     async fn sys_storage_resize<T: MetadataManager + Send + Sync>(
         &mut self,
@@ -285,8 +352,81 @@ impl SysStorage for StorageFilesystem {
         _mdm: &mut T,
         _fx_id: &FxId,
         _rc: impl FxResourceConstraints,
-        _resize_requests: Vec<StorageResizeRequest>,
+        resize_requests: Vec<StorageResizeRequest>,
     ) -> Result<Self::SysStorageResizeResult, Self::SysStorageResizeError> {
+        if !resize_requests.is_empty() {
+            return Err(StorageFilesystemError::Unsupported("StorageFilesystem does not resize provider disks"));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::empy_implementations::Metadataless;
+    use crate::host_id::HostId;
+    use crate::machine_conf::ResourceConstraintless;
+
+    fn unique_storage_root() -> PathBuf {
+        std::env::temp_dir().join(format!("becky-storage-test-{}", std::process::id()))
+    }
+
+    fn test_system_configuration(root: &Path) -> SystemConfiguration {
+        SystemConfiguration {
+            emulator_paths: Vec::new(),
+            binary_paths: Vec::new(),
+            run_path: root.join("run"),
+            vm_root_path: root.join("vm"),
+            vm_data_root_path: root.join("data"),
+            os_cache_root_path: root.join("os-cache"),
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_create_and_open_validate_directories() -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_storage_root();
+        let sys_conf = test_system_configuration(&root);
+        let mut storage = StorageFilesystem::default();
+        let mut metadata = Metadataless {};
+        let host_id = HostId::String("host".to_string());
+        let fx_id = FxId::String("fx".to_string());
+
+        storage
+            .sys_storage_create(&sys_conf, &host_id, &mut metadata, &fx_id, &ResourceConstraintless)
+            .await?;
+        storage.sys_storage_open(&host_id, &mut metadata, &fx_id, ResourceConstraintless).await?;
+        storage.sys_storage_close(&host_id, &mut metadata, &fx_id, ResourceConstraintless).await?;
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filesystem_storage_resize_reports_unsupported_requests() {
+        let mut storage = StorageFilesystem::default();
+        let mut metadata = Metadataless {};
+        let request = StorageResizeRequest {
+            filepath: StorageConfigurationDisk {
+                id: "disk".to_string(),
+                path: PathBuf::from("disk.img"),
+                size: ByteSize::b(1),
+                bootable: false,
+            },
+            new_size: ByteSize::b(2),
+            dir: StorageResizeRequestDirection::Grow,
+        };
+
+        let result = storage
+            .sys_storage_resize(
+                &HostId::String("host".to_string()),
+                &mut metadata,
+                &FxId::String("fx".to_string()),
+                ResourceConstraintless,
+                vec![request],
+            )
+            .await;
+
+        assert!(matches!(result, Err(StorageFilesystemError::Unsupported(_))));
     }
 }

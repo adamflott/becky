@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use becky_engine::FxAccounting;
 use becky_engine::control::FxControl;
@@ -571,8 +571,17 @@ impl FxControl for FxSystemCommand {
                     });
                 }
 
-                let child = proc.spawn()?;
-                info!("spawned process: {} {:?}", self.command, self.args);
+                let mut child = proc.spawn()?;
+
+                match child.try_wait() {
+                    Ok(f) => {
+                        info!("{:?}", f);
+                    }
+                    Err(e) => {
+                        error!("failed to wait for child process {}", e);
+                    }
+                }
+
                 let maybe_pid = child.id();
                 let shared_child = Arc::new(RwLock::new(child));
 
@@ -583,8 +592,20 @@ impl FxControl for FxSystemCommand {
                     }
                     Some(found_pid) => {
                         self.state = FxExecutionState::Running(found_pid);
-                        info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
-                        found_pid
+                        let s = System::new_all();
+                        if let Some(process) = s.process(Pid::from_u32(found_pid)) {
+                            if command_equal(&self.command, &self.args, process.cmd()) {
+                                info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
+                                found_pid
+                            } else {
+                                return Err(FxSysCommandError::String(format!(
+                                    "pid {} does not match command {:?}",
+                                    found_pid, self.command
+                                )));
+                            }
+                        } else {
+                            return Err(FxSysCommandError::String(format!("pid {} does not exist", found_pid)));
+                        }
                     }
                 };
                 let value = shared_child.clone();
@@ -593,7 +614,7 @@ impl FxControl for FxSystemCommand {
                     while rx.recv().await.is_some() {}
                     info!("sending sigkill to process");
                     let _ = value.write().await.kill().await;
-                    info!("sent sigkill to process");
+                    info!("sent sigkill to process, wait()ing");
                     value.write().await.wait().await
                 });
 

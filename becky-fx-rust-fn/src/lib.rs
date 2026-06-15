@@ -36,6 +36,7 @@ pub const DEFAULT_WORKER_ARG: &str = "--becky-rust-fn";
 
 /// Polling interval used for reattached pid monitors.
 pub const DEFAULT_REATTACH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub const DEFAULT_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Context passed to a registered Rust function worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +175,15 @@ pub enum RustFnError {
     /// A signal could not be sent to the process.
     #[error("failed to signal process {0}")]
     SignalFailed(u32),
+
+    /// Worker did not exit before the stop timeout elapsed.
+    #[error("process {pid} did not exit within {timeout:?}")]
+    StopTimeout {
+        /// Process id.
+        pid: u32,
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
 }
 
 /// Rust function worker process configuration.
@@ -260,6 +270,14 @@ impl FxRustFn {
         tokio::fs::create_dir_all(&self.run_dir).await?;
         tokio::fs::write(self.pid_file(), pid.to_string()).await?;
         Ok(())
+    }
+
+    async fn remove_pid_file(&self) -> Result<(), RustFnError> {
+        match tokio::fs::remove_file(self.pid_file()).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(RustFnError::Io(err)),
+        }
     }
 
     fn process_matches(&self, pid: u32) -> bool {
@@ -367,6 +385,7 @@ impl FxControl for FxRustFn {
                     function: self.function.clone(),
                 });
             }
+            self.remove_pid_file().await?;
         }
 
         let executable = self.executable()?;
@@ -428,7 +447,12 @@ impl FxControl for FxRustFn {
     type FxStopError = RustFnError;
 
     async fn fx_stop(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStopResult, Self::FxStopError> {
-        signal_process(handle.pid, sysinfo::Signal::Term)
+        signal_process(handle.pid, sysinfo::Signal::Term)?;
+        wait_for_process_exit(handle.pid, DEFAULT_STOP_WAIT_TIMEOUT).await?;
+        handle.stop_monitor().await;
+        self.remove_pid_file().await?;
+        *handle.latest_state.write().await = FxExecutionState::Stopped;
+        Ok(())
     }
 
     type FxDestroyResult = ();
@@ -436,7 +460,15 @@ impl FxControl for FxRustFn {
 
     async fn fx_destroy(&self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
         handle.stop_monitor().await;
-        signal_process(handle.pid, sysinfo::Signal::Kill)
+        if process_exists(handle.pid) {
+            signal_process(handle.pid, sysinfo::Signal::Kill)?;
+        }
+        match tokio::fs::remove_file(self.pid_file()).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(RustFnError::Io(err)),
+        }
+        Ok(())
     }
 
     type FxArchiveResult = ();
@@ -508,6 +540,19 @@ async fn monitor_reattached_pid(
 
 fn process_exists(pid: u32) -> bool {
     System::new_all().process(Pid::from_u32(pid)).is_some()
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), RustFnError> {
+    let start = tokio::time::Instant::now();
+    loop {
+        if !process_exists(pid) {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(RustFnError::StopTimeout { pid, timeout });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn signal_process(pid: u32, signal: sysinfo::Signal) -> Result<(), RustFnError> {
