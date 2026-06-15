@@ -39,9 +39,10 @@ sysinfo = "0.39.2"
 thiserror = "2.0.18"
 tokio = {  version = "1.52.3", features = [ "full", "signal"] }
 tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 uuid = {  version = "1.23.1", features = ["v4"] }
 which = "8.0.2"
-wora = { version = "0.0.13" }
+wora = { version = "0.0.14" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

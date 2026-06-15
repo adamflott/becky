@@ -36,7 +36,7 @@ use crate::verify::FxVerify;
 
 #[async_trait]
 /// Runs the engine's long-lived reconciliation or event loop.
-pub trait MainLoop<Event, Metric>: MetadataUpdate + ControlEngine {
+pub trait MainLoop<Event: Send + 'static, Metric>: MetadataUpdate + ControlEngine {
     /// Executes the main engine loop and returns the retry action requested by
     /// the runtime.
     async fn mainloop(
@@ -53,7 +53,7 @@ pub trait MainLoop<Event, Metric>: MetadataUpdate + ControlEngine {
 /// Implementors are expected to provide host lifecycle hooks, metadata
 /// management, system scanning, state collection, effect control, live movement,
 /// and verification.
-pub trait FxEngine<Event, Metric, Metadata>:
+pub trait FxEngine<Event: Send + 'static, Metric, Metadata>:
     Send
     + Sync
     + HostSysInit<Event, Metric>

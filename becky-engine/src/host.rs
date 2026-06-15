@@ -10,7 +10,7 @@ use crate::metadata::MetadataManager;
 
 #[async_trait]
 /// Host setup hooks run by an engine during startup.
-pub trait HostSysInit<Event, Metric> {
+pub trait HostSysInit<Event: Send + 'static, Metric> {
     /// Performs early host boot work before full setup.
     async fn host_system_boot(&mut self, exec: &impl AsyncExecutor<Event, Metric>, fs: &(impl WFS + 'static), hi: &HostInfo) -> Result<(), ()>;
 
@@ -20,7 +20,7 @@ pub trait HostSysInit<Event, Metric> {
 
 #[async_trait]
 /// Host teardown hooks run by an engine during shutdown.
-pub trait HostSysEnd<Event, Metric> {
+pub trait HostSysEnd<Event: Send + 'static, Metric> {
     /// Performs host cleanup before the engine exits.
     async fn host_system_end(&mut self, exec: impl AsyncExecutor<Event, Metric>, fs: impl WFS + 'static, hi: &HostInfo) -> Result<(), ()>;
 }
