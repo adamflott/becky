@@ -599,6 +599,13 @@ impl FxControl for FxContainerDocker {
         Ok(())
     }
 
+    type FxBootstrapResult = ();
+    type FxBootstrapError = ();
+
+    async fn fx_bootstrap<T: MetadataManager>(&mut self, host_id: &HostId, fx_id: &FxId, mdt: &mut T, rc: &impl FxResourceConstraints, storage: &mut impl SysStorage) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
+        todo!()
+    }
+
     type FxSpawnResult = DockerContainerHandle;
     type FxSpawnError = FxDockerError;
 

@@ -480,6 +480,13 @@ impl FxControl for FxSystemCommand {
         Ok(())
     }
 
+    type FxBootstrapResult = ();
+    type FxBootstrapError = ();
+
+    async fn fx_bootstrap<T: MetadataManager>(&mut self, host_id: &HostId, fx_id: &FxId, mdt: &mut T, rc: &impl FxResourceConstraints, storage: &mut impl SysStorage) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
+        Ok(())
+    }
+
     type FxSpawnResult = FxSystemProcessRunning;
     type FxSpawnError = FxSysCommandError;
 

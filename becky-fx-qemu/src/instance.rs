@@ -457,6 +457,13 @@ impl FxControl for QemuInstance {
         }
     }
 
+    type FxBootstrapResult = ();
+    type FxBootstrapError = ();
+
+    async fn fx_bootstrap<T: MetadataManager>(&mut self, host_id: &HostId, fx_id: &FxId, mdt: &mut T, rc: &impl FxResourceConstraints, storage: &mut impl SysStorage) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
+        todo!()
+    }
+
     type FxSpawnResult = QemuHandle;
     type FxSpawnError = SpawnError;
 
