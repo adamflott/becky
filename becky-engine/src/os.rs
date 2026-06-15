@@ -4,7 +4,7 @@ use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::fs::File;
@@ -21,9 +21,9 @@ pub enum DownloadError {
 }
 
 /// Downloads `url` to `filename` using an async HTTP client.
-pub async fn download_file(url: &str, filename: &PathBuf) -> Result<(), DownloadError> {
+pub async fn download_file(url: &str, filename: &Path) -> Result<(), DownloadError> {
     let client = Client::new();
-    let mut response = client.get(url).send().await?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
     let mut file = File::create(filename).await?;
 
     while let Some(chunk) = response.chunk().await? {

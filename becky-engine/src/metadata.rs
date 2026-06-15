@@ -109,9 +109,9 @@ pub trait OsImage: Send + Sync {
     type ImageDef;
     /// Image synchronization error type.
     type SyncError: Debug;
-    // async fn sync_image(&self, cache_root_dir: &PathBuf, image: Self::ImageDef) -> Result<(), ()>;
+    // async fn sync_image(&self, cache_root_dir: &Path, image: Self::ImageDef) -> Result<(), ()>;
     /// Synchronizes all configured images into `cache_root_dir`.
-    async fn sync_images(&mut self, cache_root_dir: &PathBuf) -> Result<(), Self::SyncError>;
+    async fn sync_images(&mut self, cache_root_dir: &Path) -> Result<(), Self::SyncError>;
 
     /// Returns the cache filename for a supported OS.
     fn get_filename(&self, image: &SupportedOs) -> PathBuf;
