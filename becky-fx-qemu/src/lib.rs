@@ -6,7 +6,7 @@ pub mod manager;
 pub mod storage_qcow;
 pub mod utils;
 
-use crate::img_json::QemuImgInfo;
+use crate::img_json::{FormatSpecificRoot, QemuImgInfo};
 use crate::storage_qcow::{QEMU_IMG_FILE_EXIT_RAW, QEMU_IMG_FILE_EXT_QCOW2, QEMU_IMG_FORMAT_QCOW2, QEMU_IMG_FORMAT_RAW, QcowOptions, is_qcow_image_corrupt};
 use async_trait::async_trait;
 use becky_engine::boot_methods::BootMethod;
@@ -199,6 +199,7 @@ impl FxResourceConstraints for QemuMachineRequest {
     type Metadata = Metadataless;
     type FxStorageConfiguration = Vec<QemuStorageType>;
     type FxConfiguration = QemuMachineRequest;
+    type FxConfigurationError = ();
 
     fn convert_from_metadata_to_fx_configuration(&self, _mdt: Self::Metadata) -> Result<Self::FxConfiguration, ()> {
         Ok(self.clone())
@@ -281,11 +282,14 @@ impl SysStorage for QemuMachineConfiguration {
                         .await
                         {
                             Ok(cmd) => match serde_json::from_slice::<QemuImgInfo>(cmd.output.stdout.as_slice()) {
-                                Ok(img) => {
-                                    if img.format_specific.data.corrupt {
-                                        errors.push(QemuStorageCreateError::CorruptImage(filename.clone()));
+                                Ok(img) => match img.format_specific {
+                                    None => {}
+                                    Some(fmt) => {
+                                        if fmt.data.corrupt {
+                                            errors.push(QemuStorageCreateError::CorruptImage(filename.clone()));
+                                        }
                                     }
-                                }
+                                },
                                 Err(json_parse_err) => {
                                     errors.push(QemuStorageCreateError::JsonParse(json_parse_err));
                                 }
