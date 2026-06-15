@@ -22,7 +22,7 @@ futures = { workspace = true}
 libc = {workspace = true}
 libproc = { workspace = true}
 qapi = { workspace = true }
-qemu-command-builder = {  version = "11.0.0-0", path = "../../../vmm-command-builders/qemu-command-builder" }
+qemu-command-builder = {  version = "11.0.0-0" }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
