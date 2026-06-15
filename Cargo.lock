@@ -226,8 +226,6 @@ dependencies = [
  "becky-fx-system-command",
  "becky-utils",
  "bon",
- "bytesize",
- "clap",
  "futures",
  "libc 1.0.0-alpha.3",
  "libproc",
