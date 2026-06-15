@@ -165,24 +165,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bare"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "becky-engine",
- "becky-fx-id",
- "becky-fx-system-command",
- "clap",
- "serde",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wora",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

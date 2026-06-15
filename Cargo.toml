@@ -7,8 +7,7 @@ members = [
     "becky-fx-qemu",
     "becky-fx-rust-fn",
     "becky-fx-system-command",
-    "becky-utils",
-    "examples/bare"
+    "becky-utils"
 ]
 
 [workspace.package]
