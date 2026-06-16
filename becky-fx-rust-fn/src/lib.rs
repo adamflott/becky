@@ -479,10 +479,20 @@ impl FxControl for FxRustFn {
     type FxDestroyError = RustFnError;
 
     async fn fx_destroy(&self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
-        handle.stop_monitor().await;
-        if process_exists(handle.pid) {
-            signal_process(handle.pid, sysinfo::Signal::Kill)?;
+        match observe_worker_process(handle.pid, &handle.worker_arg, &handle.function) {
+            ObservedProcess::Matching => {
+                signal_process(handle.pid, sysinfo::Signal::Kill)?;
+                wait_for_process_exit(handle.pid, DEFAULT_STOP_WAIT_TIMEOUT).await?;
+            }
+            ObservedProcess::Mismatched => {
+                return Err(RustFnError::PidMismatch {
+                    pid: handle.pid,
+                    function: handle.function.clone(),
+                });
+            }
+            ObservedProcess::Missing => {}
         }
+        handle.stop_monitor().await;
         match tokio::fs::remove_file(self.pid_file()).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -778,6 +788,48 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&run_dir).await;
         assert!(!matching_worker_process_exists("-c", &script));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_kills_worker_waits_and_removes_pid_file() {
+        let unique = format!("becky-rust-fn-destroy-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let run_dir = std::env::temp_dir().join(format!("{unique}.run-dir"));
+        let _ = tokio::fs::remove_file(&run_dir).await;
+        let _ = tokio::fs::remove_dir_all(&run_dir).await;
+
+        let mut fx = FxRustFn::new(script.clone(), &run_dir);
+        fx.executable = Some(PathBuf::from("/bin/sh"));
+        fx.worker_arg = "-c".to_string();
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+        let mut handle = match fx
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("fx".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(err) => panic!("worker should start: {err}"),
+        };
+
+        let pid_file = fx.pid_file();
+        assert!(pid_file.exists());
+        assert!(matching_worker_process_exists("-c", &script));
+
+        if let Err(err) = fx.fx_destroy(&mut handle).await {
+            panic!("worker should be destroyed: {err}");
+        }
+
+        assert!(!pid_file.exists());
+        assert!(!matching_worker_process_exists("-c", &script));
+        assert!(handle.monitor.is_none());
+        let _ = tokio::fs::remove_dir_all(&run_dir).await;
     }
 
     #[cfg(unix)]
