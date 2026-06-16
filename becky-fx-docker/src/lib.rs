@@ -604,11 +604,11 @@ impl FxControl for FxContainerDocker {
 
     async fn fx_bootstrap<T: MetadataManager>(
         &mut self,
-        host_id: &HostId,
-        fx_id: &FxId,
-        mdt: &mut T,
-        rc: &impl FxResourceConstraints,
-        storage: &mut impl SysStorage,
+        _host_id: &HostId,
+        _fx_id: &FxId,
+        _mdt: &mut T,
+        _rc: &impl FxResourceConstraints,
+        _storage: &mut impl SysStorage,
     ) -> Result<Self::FxBootstrapResult, Self::FxBootstrapError> {
         todo!()
     }
