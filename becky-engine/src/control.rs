@@ -50,7 +50,7 @@ pub trait FxControl: Send + Sync + Debug + FxAccounting {
         mdt: &mut T,
         rc: &impl FxResourceConstraints,
         storage: &mut impl SysStorage,
-    ) -> Result<Self::FxAllocateResult, Self::FxAllocateError>;
+    ) -> Result<Self::FxBootstrapResult, Self::FxBootstrapError>;
 
     /// Spawn/start result type, usually a process or provider handle.
     type FxSpawnResult;

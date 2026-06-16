@@ -609,7 +609,7 @@ impl FxControl for FxContainerDocker {
         mdt: &mut T,
         rc: &impl FxResourceConstraints,
         storage: &mut impl SysStorage,
-    ) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
+    ) -> Result<Self::FxBootstrapResult, Self::FxBootstrapError> {
         todo!()
     }
 
