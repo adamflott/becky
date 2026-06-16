@@ -279,13 +279,6 @@ impl FxRustFn {
             Err(err) => Err(RustFnError::Io(err)),
         }
     }
-
-    fn process_matches(&self, pid: u32) -> bool {
-        let system = System::new_all();
-        system
-            .process(Pid::from_u32(pid))
-            .is_some_and(|process| process_cmd_contains_worker(process.cmd(), &self.worker_arg, &self.function))
-    }
 }
 
 /// Handle for an owned or reattached Rust function worker process.
@@ -296,6 +289,7 @@ pub struct RustFnHandle {
     pub function: String,
     /// Whether this start call reattached to an existing pid-file process.
     pub reattached: bool,
+    worker_arg: String,
     latest_state: Arc<RwLock<FxExecutionState>>,
     cancel_monitor: Sender<()>,
     monitor: Option<JoinHandle<()>>,
@@ -307,6 +301,7 @@ impl Debug for RustFnHandle {
             .field("pid", &self.pid)
             .field("function", &self.function)
             .field("reattached", &self.reattached)
+            .field("worker_arg", &self.worker_arg)
             .field("monitor_finished", &self.monitor.as_ref().is_none_or(JoinHandle::is_finished))
             .finish_non_exhaustive()
     }
@@ -376,16 +371,23 @@ impl FxControl for FxRustFn {
         _storage: &mut impl SysStorage,
     ) -> Result<Self::FxSpawnResult, Self::FxSpawnError> {
         if let Some(pid) = self.read_pid_file().await? {
-            if self.process_matches(pid) {
-                return Ok(reattached_handle(pid, self.function.clone(), self.reattach_poll_interval));
+            match observe_worker_process(pid, &self.worker_arg, &self.function) {
+                ObservedProcess::Matching => {
+                    return Ok(reattached_handle(
+                        pid,
+                        self.function.clone(),
+                        self.worker_arg.clone(),
+                        self.reattach_poll_interval,
+                    ));
+                }
+                ObservedProcess::Mismatched => {
+                    return Err(RustFnError::PidMismatch {
+                        pid,
+                        function: self.function.clone(),
+                    });
+                }
+                ObservedProcess::Missing => self.remove_pid_file().await?,
             }
-            if process_exists(pid) {
-                return Err(RustFnError::PidMismatch {
-                    pid,
-                    function: self.function.clone(),
-                });
-            }
-            self.remove_pid_file().await?;
         }
 
         let executable = self.executable()?;
@@ -429,6 +431,7 @@ impl FxControl for FxRustFn {
             pid,
             function: self.function.clone(),
             reattached: false,
+            worker_arg: self.worker_arg.clone(),
             latest_state,
             cancel_monitor,
             monitor: Some(monitor),
@@ -439,12 +442,24 @@ impl FxControl for FxRustFn {
     type FxStatusError = RustFnError;
 
     async fn fx_status(&mut self, handle: &mut Self::FxSpawnResult) -> Result<Self::FxStatusResult, Self::FxStatusError> {
-        if process_exists(handle.pid) {
-            let state = FxExecutionState::Running(handle.pid);
-            *handle.latest_state.write().await = state.clone();
-            Ok(state)
-        } else {
-            Ok(handle.latest_state().await)
+        match observe_worker_process(handle.pid, &handle.worker_arg, &handle.function) {
+            ObservedProcess::Matching => {
+                let state = FxExecutionState::Running(handle.pid);
+                *handle.latest_state.write().await = state.clone();
+                Ok(state)
+            }
+            ObservedProcess::Mismatched => {
+                let state = FxExecutionState::Error(format!("pid {} no longer matches rust function worker {:?}", handle.pid, handle.function));
+                *handle.latest_state.write().await = state;
+                Err(RustFnError::PidMismatch {
+                    pid: handle.pid,
+                    function: handle.function.clone(),
+                })
+            }
+            ObservedProcess::Missing => {
+                let state = handle.latest_state().await;
+                Ok(state)
+            }
         }
     }
 
@@ -509,14 +524,22 @@ impl FxAccounting for FxRustFn {
     }
 }
 
-fn reattached_handle(pid: u32, function: String, poll_interval: Duration) -> RustFnHandle {
+fn reattached_handle(pid: u32, function: String, worker_arg: String, poll_interval: Duration) -> RustFnHandle {
     let latest_state = Arc::new(RwLock::new(FxExecutionState::Running(pid)));
     let (cancel_monitor, cancel_rx) = tokio::sync::mpsc::channel(1);
-    let monitor = tokio::spawn(monitor_reattached_pid(pid, latest_state.clone(), cancel_rx, poll_interval));
+    let monitor = tokio::spawn(monitor_reattached_pid(
+        pid,
+        function.clone(),
+        worker_arg.clone(),
+        latest_state.clone(),
+        cancel_rx,
+        poll_interval,
+    ));
     RustFnHandle {
         pid,
         function,
         reattached: true,
+        worker_arg,
         latest_state,
         cancel_monitor,
         monitor: Some(monitor),
@@ -525,14 +548,23 @@ fn reattached_handle(pid: u32, function: String, poll_interval: Duration) -> Rus
 
 async fn monitor_reattached_pid(
     pid: u32,
+    function: String,
+    worker_arg: String,
     latest_state: Arc<RwLock<FxExecutionState>>,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
     poll_interval: Duration,
 ) {
     loop {
-        if !process_exists(pid) {
-            *latest_state.write().await = FxExecutionState::NotStarted;
-            break;
+        match observe_worker_process(pid, &worker_arg, &function) {
+            ObservedProcess::Matching => {}
+            ObservedProcess::Missing => {
+                *latest_state.write().await = FxExecutionState::NotStarted;
+                break;
+            }
+            ObservedProcess::Mismatched => {
+                *latest_state.write().await = FxExecutionState::Error(format!("pid {pid} no longer matches rust function worker {function:?}"));
+                break;
+            }
         }
 
         tokio::select! {
@@ -541,6 +573,22 @@ async fn monitor_reattached_pid(
         }
     }
     debug!("rust-fn reattach monitor stopped pid:{}", pid);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedProcess {
+    Matching,
+    Mismatched,
+    Missing,
+}
+
+fn observe_worker_process(pid: u32, worker_arg: &str, function: &str) -> ObservedProcess {
+    let system = System::new_all();
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) if process_cmd_contains_worker(process.cmd(), worker_arg, function) => ObservedProcess::Matching,
+        Some(_) => ObservedProcess::Mismatched,
+        None => ObservedProcess::Missing,
+    }
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -645,6 +693,50 @@ mod tests {
         let cmd = vec!["/tmp/app", DEFAULT_WORKER_ARG, "work"];
         assert!(process_cmd_contains_worker(&cmd, DEFAULT_WORKER_ARG, "work"));
         assert!(!process_cmd_contains_worker(&cmd, DEFAULT_WORKER_ARG, "other"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_pid_mismatch_for_live_non_worker_process() {
+        let (cancel_monitor, _cancel_rx) = tokio::sync::mpsc::channel(1);
+        let mut handle = RustFnHandle {
+            pid: std::process::id(),
+            function: "work".to_string(),
+            reattached: true,
+            worker_arg: DEFAULT_WORKER_ARG.to_string(),
+            latest_state: Arc::new(RwLock::new(FxExecutionState::Running(std::process::id()))),
+            cancel_monitor,
+            monitor: None,
+        };
+        let mut fx = FxRustFn::new("work", std::env::temp_dir());
+
+        let result = fx.fx_status(&mut handle).await;
+
+        assert!(matches!(
+            result,
+            Err(RustFnError::PidMismatch {
+                pid,
+                function
+            }) if pid == std::process::id() && function == "work"
+        ));
+        assert!(matches!(handle.latest_state().await, FxExecutionState::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn reattach_monitor_marks_live_non_worker_pid_as_error() {
+        let latest_state = Arc::new(RwLock::new(FxExecutionState::Running(std::process::id())));
+        let (_cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+
+        monitor_reattached_pid(
+            std::process::id(),
+            "work".to_string(),
+            DEFAULT_WORKER_ARG.to_string(),
+            latest_state.clone(),
+            cancel_rx,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(matches!(*latest_state.read().await, FxExecutionState::Error(_)));
     }
 
     #[cfg(unix)]
