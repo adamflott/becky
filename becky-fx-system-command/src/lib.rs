@@ -332,6 +332,9 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> Result<(), FxSysComman
     }
 
     #[allow(unsafe_code)]
+    // SAFETY: `libc::kill` is called with a negative process id to target the
+    // child process group created with `setpgid(0, 0)` before exec. The signal
+    // value is supplied by this module from libc constants.
     let sent = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
     if sent == 0 { Ok(()) } else { Err(FxSysCommandError::SignalFailedToSend) }
 }
@@ -584,11 +587,16 @@ impl FxControl for FxSystemCommand {
                 proc.stdin(Stdio::null());
                 proc.kill_on_drop(false);
                 #[allow(unsafe_code)]
+                // SAFETY: `pre_exec` runs in the child after fork and before
+                // exec. The closure only calls async-signal-safe `setpgid` and
+                // converts its return value into an `io::Result`.
                 unsafe {
                     proc.pre_exec(|| {
-                        // Creates a new process group for the child
-                        libc::setpgid(0, 0);
-                        Ok(())
+                        if libc::setpgid(0, 0) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
                     });
                 }
 
