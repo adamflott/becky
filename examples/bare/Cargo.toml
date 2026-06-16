@@ -1,0 +1,17 @@
+[package]
+name = "bare"
+edition = "2024"
+
+[dependencies]
+async-trait = {  workspace = true }
+becky-engine = { version = "*", path = "../../becky-engine" }
+becky-fx-id = { version = "*", path = "../../becky-fx-id" }
+becky-fx-system-command = { version = "*", path = "../../becky-fx-system-command" }
+clap = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = {  workspace = true }
+tracing-subscriber = { workspace = true }
+wora = { workspace = true }

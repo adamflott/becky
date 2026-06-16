@@ -68,6 +68,10 @@ pub enum FxSysCommandError {
     /// The process exists but its command vector is empty.
     #[error("pid {0} has an empty command vector")]
     EmptyCommand(u32),
+
+    /// The process did not exit before the destroy wait deadline elapsed.
+    #[error("pid {0} did not exit after destroy")]
+    ProcessDidNotExit(u32),
 }
 
 /// A Unix process scheduling priority used with `nice`.
@@ -144,11 +148,10 @@ pub struct FxSystemCommand {
     /// Optional process priority to apply by launching through `nice`.
     pub nice_level: Option<NiceLevel>,
 
-    /// Optional directory reserved for pid-file based tracking.
+    /// Optional directory for pid-file based tracking.
     ///
-    /// The current implementation does not write pid files, but the field is
-    /// part of the command configuration for callers that need to carry this
-    /// setting.
+    /// When set, starts write pid files under this directory and later starts
+    /// use those files before falling back to command-line process scans.
     pub pid_directory: Option<PathBuf>,
 
     /// Optional Linux CPU affinity list applied by launching through `taskset`.
@@ -288,7 +291,9 @@ impl FxSystemProcessRunning {
         match self {
             FxSystemProcessRunning::Tokio(handle) => {
                 signal_process_group(handle.pid, libc::SIGKILL)?;
-                let _ = handle.tx.take();
+                if let Some(tx) = handle.tx.take() {
+                    let _ = tx.send(()).await;
+                }
                 match handle.handle.take() {
                     Some(waiter) => match waiter.await {
                         Ok(Ok(_)) => Ok(()),
@@ -302,7 +307,10 @@ impl FxSystemProcessRunning {
                     },
                 }
             }
-            FxSystemProcessRunning::Pid(pid) => signal_process(*pid, sysinfo::Signal::Kill),
+            FxSystemProcessRunning::Pid(pid) => {
+                signal_process(*pid, sysinfo::Signal::Kill)?;
+                wait_for_pid_exit(*pid).await
+            }
         }
     }
 }
@@ -310,6 +318,105 @@ impl FxSystemProcessRunning {
 async fn cleanup_spawned_child(mut child: tokio::process::Child) {
     if let Err(err) = child.kill().await {
         error!("failed to clean up spawned child after start error: {err}");
+    }
+}
+
+fn encode_command_id(command: &str, args: &[String]) -> String {
+    let mut encoded = String::new();
+    append_id_component(&mut encoded, command);
+    for arg in args {
+        append_id_component(&mut encoded, arg);
+    }
+    encoded
+}
+
+fn append_id_component(encoded: &mut String, value: &str) {
+    encoded.push_str(&value.len().to_string());
+    encoded.push(':');
+    encoded.push_str(value);
+}
+
+fn launch_command_line(command: &FxSystemCommand) -> (String, Vec<String>) {
+    let (cmd, args) = match &command.nice_level {
+        None => (command.command.clone(), command.args.clone()),
+        Some(nice_level) => {
+            let mut nice_args = vec!["-n".to_string(), nice_level.to_string(), command.command.clone()];
+            nice_args.extend(command.args.iter().cloned());
+            ("nice".to_string(), nice_args)
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let (cmd, args) = match &command.pin_to_cpus {
+        Some(cpus) => {
+            let mut cpu_args = vec!["-c".to_string(), cpus.iter().map(|cpu| cpu.to_string()).collect::<Vec<_>>().join(","), cmd];
+            cpu_args.extend(args);
+            ("taskset".to_string(), cpu_args)
+        }
+        None => (cmd, args),
+    };
+
+    (cmd, args)
+}
+
+fn pid_file_path(command: &FxSystemCommand, fx_id: &FxId) -> Option<PathBuf> {
+    command.pid_directory.as_ref().map(|dir| dir.join(format!("{}.pid", pid_file_stem(fx_id))))
+}
+
+fn pid_file_stem(fx_id: &FxId) -> String {
+    let mut stem = String::from("fx-");
+    for byte in fx_id.to_string().as_bytes() {
+        stem.push_str(&format!("{byte:02x}"));
+    }
+    stem
+}
+
+async fn read_pid_file(path: &PathBuf) -> Result<Option<u32>, FxSysCommandError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => match contents.trim().parse::<u32>() {
+            Ok(pid) => Ok(Some(pid)),
+            Err(_) => Ok(None),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FxSysCommandError::IO(err)),
+    }
+}
+
+async fn write_pid_file(path: &PathBuf, pid: u32) -> Result<(), FxSysCommandError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, format!("{pid}\n")).await?;
+    Ok(())
+}
+
+async fn remove_pid_file(path: &PathBuf) -> Result<(), FxSysCommandError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(FxSysCommandError::IO(err)),
+    }
+}
+
+fn pid_matches_command(pid: u32, cmd: &str, args: &[String]) -> bool {
+    let s = System::new_all();
+    if let Some(process) = s.process(Pid::from_u32(pid)) {
+        command_equal(cmd, args, process.cmd())
+    } else {
+        false
+    }
+}
+
+async fn running_pid_from_pid_file(path: &PathBuf, cmd: &str, args: &[String]) -> Result<Option<u32>, FxSysCommandError> {
+    let Some(pid) = read_pid_file(path).await? else {
+        return Ok(None);
+    };
+
+    if pid_matches_command(pid, cmd, args) {
+        Ok(Some(pid))
+    } else {
+        remove_pid_file(path).await?;
+        Ok(None)
     }
 }
 
@@ -342,6 +449,28 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> Result<(), FxSysComman
     // value is supplied by this module from libc constants.
     let sent = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
     if sent == 0 { Ok(()) } else { Err(FxSysCommandError::SignalFailedToSend) }
+}
+
+fn process_exists(pid: u32) -> bool {
+    System::new_all().process(Pid::from_u32(pid)).is_some()
+}
+
+async fn wait_for_pid_exit(pid: u32) -> Result<(), FxSysCommandError> {
+    const DESTROY_EXIT_POLL_ATTEMPTS: usize = 100;
+    const DESTROY_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    for _ in 0..DESTROY_EXIT_POLL_ATTEMPTS {
+        if !process_exists(pid) {
+            return Ok(());
+        }
+        tokio::time::sleep(DESTROY_EXIT_POLL_INTERVAL).await;
+    }
+
+    if process_exists(pid) {
+        Err(FxSysCommandError::ProcessDidNotExit(pid))
+    } else {
+        Ok(())
+    }
 }
 
 /// Compares a command and its arguments with a slice of `OsString`.
@@ -482,12 +611,10 @@ impl FxSystemCommand {
 impl FxControl for FxSystemCommand {
     type Id = String;
 
-    /// Returns a stable command identifier made from the executable and
-    /// arguments joined with spaces.
+    /// Returns a stable command identifier using a length-prefixed encoding of
+    /// the executable and arguments.
     fn id(&self) -> Self::Id {
-        let mut cmd_and_args = self.args.clone();
-        cmd_and_args.insert(0, self.command.clone());
-        cmd_and_args.join(" ")
+        encode_command_id(&self.command, &self.args)
     }
 
     type FxAllocateResult = ();
@@ -514,11 +641,11 @@ impl FxControl for FxSystemCommand {
 
     async fn fx_bootstrap<T: MetadataManager>(
         &mut self,
-        host_id: &HostId,
-        fx_id: &FxId,
-        mdt: &mut T,
-        rc: &impl FxResourceConstraints,
-        storage: &mut impl SysStorage,
+        _host_id: &HostId,
+        _fx_id: &FxId,
+        _mdt: &mut T,
+        _rc: &impl FxResourceConstraints,
+        _storage: &mut impl SysStorage,
     ) -> Result<Self::FxAllocateResult, Self::FxAllocateError> {
         Ok(())
     }
@@ -532,46 +659,49 @@ impl FxControl for FxSystemCommand {
     /// returns a pid-only handle. Otherwise it spawns the configured command,
     /// optionally wrapping it with `nice` or, on Linux, `taskset`.
     ///
-    /// On Linux, CPU pinning takes precedence over `nice` when both are set,
-    /// because the `taskset` wrapper replaces the command line prepared for
-    /// `nice`.
+    /// On Linux, CPU pinning composes with `nice` by launching
+    /// `taskset -c <cpus> nice -n <level> <command> ...`.
     async fn fx_start<T: MetadataManager>(
         &mut self,
         _host_id: &HostId,
-        _fx_id: &FxId,
+        fx_id: &FxId,
         _mdt: &mut T,
         _rc: &impl FxResourceConstraints,
         _storage: &mut impl SysStorage,
     ) -> Result<Self::FxSpawnResult, Self::FxSpawnError> {
         self.desired_state = FxDesiredExecutionState::Running;
-        match self.current_system_state() {
+        let (cmd, args) = launch_command_line(self);
+        let pid_file = pid_file_path(self, fx_id);
+
+        if let Some(path) = &pid_file
+            && let Some(pid) = running_pid_from_pid_file(path, &cmd, &args).await?
+        {
+            self.state = FxExecutionState::Running(pid);
+            info!("reattached process {} {:?} from pid file {:?} at pid {:?}", self.command, self.args, path, pid);
+            return Ok(FxSystemProcessRunning::Pid(pid));
+        }
+
+        let current_state = if pid_file.is_some() {
+            match self.state {
+                FxExecutionState::Running(pid) if pid_matches_command(pid, &cmd, &args) => FxExecutionState::Running(pid),
+                _ => FxExecutionState::NotStarted,
+            }
+        } else {
+            self.current_system_state()
+        };
+
+        match current_state {
             FxExecutionState::Running(pid) => {
                 // update internal state if it happens to not be registered (current_system_state() does not mutate self)
                 self.state = FxExecutionState::Running(pid);
+                if let Some(path) = &pid_file {
+                    write_pid_file(path, pid).await?;
+                }
                 Ok(FxSystemProcessRunning::Pid(pid))
             }
             _ => {
-                let (cmd, args) = match &self.nice_level {
-                    None => (self.command.clone(), self.args.clone()),
-                    Some(nice_level) => {
-                        let mut nice_args = vec!["-n".to_string(), nice_level.to_string(), self.command.to_string()];
-                        nice_args.append(&mut self.args.clone());
-                        ("nice".to_string(), nice_args)
-                    }
-                };
-
-                #[cfg(target_os = "linux")]
-                let (cmd, args) = match &self.pin_to_cpus {
-                    Some(cpus) => {
-                        let mut cpu_args = vec!["-c".to_string(), cpus.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(","), cmd];
-                        cpu_args.extend(args);
-                        ("taskset".to_string(), cpu_args)
-                    }
-                    None => (cmd, args),
-                };
-
-                let mut proc = tokio::process::Command::new(cmd);
-                proc.args(args);
+                let mut proc = tokio::process::Command::new(&cmd);
+                proc.args(&args);
 
                 match &self.stderr_path {
                     Some(path) => {
@@ -626,33 +756,25 @@ impl FxControl for FxSystemCommand {
                     }
                     Some(found_pid) => {
                         self.state = FxExecutionState::Running(found_pid);
-                        let s = System::new_all();
-                        if let Some(process) = s.process(Pid::from_u32(found_pid)) {
-                            if command_equal(&self.command, &self.args, process.cmd()) {
-                                info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
-                                found_pid
-                            } else {
-                                cleanup_spawned_child(child).await;
-                                return Err(FxSysCommandError::String(format!(
-                                    "pid {} does not match command {:?}",
-                                    found_pid, self.command
-                                )));
-                            }
-                        } else {
-                            cleanup_spawned_child(child).await;
-                            return Err(FxSysCommandError::String(format!("pid {} does not exist", found_pid)));
+                        if let Some(path) = &pid_file {
+                            write_pid_file(path, found_pid).await?;
                         }
+                        info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
+                        found_pid
                     }
                 };
                 let shared_child = Arc::new(RwLock::new(child));
                 let value = shared_child.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(1);
                 let handle = tokio::spawn(async move {
-                    while rx.recv().await.is_some() {}
-                    info!("sending sigkill to process");
-                    let _ = value.write().await.kill().await;
-                    info!("sent sigkill to process, wait()ing");
-                    value.write().await.wait().await
+                    if rx.recv().await.is_some() {
+                        info!("sending sigkill to process");
+                        let _ = value.write().await.kill().await;
+                        info!("sent sigkill to process, wait()ing");
+                        value.write().await.wait().await
+                    } else {
+                        Ok(ExitStatus::default())
+                    }
                 });
 
                 let handle = SystemProcessRunningTokio {
@@ -819,6 +941,46 @@ mod tests {
         assert!(!command_equal(cmd_a, &cmd_a_args, &cmd_b));
     }
 
+    #[test]
+    fn launch_command_line_composes_nice() {
+        let mut command = FxSystemCommand::new(
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "true".to_string()],
+            FxDesiredExecutionState::Running,
+        );
+        command.nice_level = Some(NiceLevel::default_priority());
+
+        let (cmd, args) = launch_command_line(&command);
+
+        assert_eq!(cmd, "nice");
+        assert_eq!(args, ["-n", "0", "/bin/sh", "-c", "true"]);
+    }
+
+    #[test]
+    fn encoded_ids_do_not_collide_for_space_join_ambiguity() {
+        let command_a = FxSystemCommand::new("ab".to_string(), vec!["c d".to_string()], FxDesiredExecutionState::Running);
+        let command_b = FxSystemCommand::new("ab c".to_string(), vec!["d".to_string()], FxDesiredExecutionState::Running);
+
+        assert_ne!(command_a.id(), command_b.id());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_command_line_composes_taskset_and_nice() {
+        let mut command = FxSystemCommand::new(
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "true".to_string()],
+            FxDesiredExecutionState::Running,
+        );
+        command.nice_level = Some(NiceLevel::default_priority());
+        command.pin_to_cpus = Some(vec![0, 1]);
+
+        let (cmd, args) = launch_command_line(&command);
+
+        assert_eq!(cmd, "taskset");
+        assert_eq!(args, ["-c", "0,1", "nice", "-n", "0", "/bin/sh", "-c", "true"]);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn destroy_kills_tokio_child_and_joins_waiter() {
@@ -856,15 +1018,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn start_cleans_up_child_when_post_spawn_validation_fails() {
-        let unique = format!("becky-system-command-start-cleanup-{}", std::process::id());
+    async fn dropping_tokio_handle_does_not_kill_child() {
+        let unique = format!("becky-system-command-drop-{}", std::process::id());
         let script = format!("while :; do sleep 1; done # {unique}");
         let mut command = FxSystemCommand::new("/bin/sh".to_string(), vec!["-c".to_string(), script.clone()], FxDesiredExecutionState::Running);
-        command.nice_level = Some(NiceLevel::default_priority());
         let mut metadata = Metadataless {};
         let mut storage = Storageless {};
 
-        let result = command
+        let process = match command
             .fx_start(
                 &HostId::String("host".to_string()),
                 &FxId::String("fx".to_string()),
@@ -872,16 +1033,233 @@ mod tests {
                 &ResourceConstraintless,
                 &mut storage,
             )
-            .await;
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => panic!("system command should start: {err}"),
+        };
 
-        assert!(matches!(result, Err(FxSysCommandError::String(_))));
+        let pid = process.get_pid();
+        assert!(matching_process_exists("/bin/sh", &["-c", &script]));
+        drop(process);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(process_exists(pid));
+
+        signal_process_group(pid, libc::SIGKILL).expect("test cleanup should kill child");
         for _ in 0..20 {
-            if !matching_process_exists("nice", &["-n", "0", "/bin/sh", "-c", &script]) {
+            if !process_exists(pid) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(!matching_process_exists("nice", &["-n", "0", "/bin/sh", "-c", &script]));
+        assert!(!process_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_spawned_child_kills_child() {
+        let unique = format!("becky-system-command-start-cleanup-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let mut child = match tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => panic!("test child should spawn: {err}"),
+        };
+
+        let Some(pid) = child.id() else {
+            let _ = child.kill().await;
+            panic!("test child should have a pid");
+        };
+        assert!(matching_process_exists("/bin/sh", &["-c", &script]));
+
+        cleanup_spawned_child(child).await;
+        for _ in 0..20 {
+            if !process_exists(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!process_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_accepts_short_lived_child_without_process_table_verification() {
+        let mut command = FxSystemCommand::new(
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "exit 0".to_string()],
+            FxDesiredExecutionState::Running,
+        );
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+
+        let mut process = match command
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("fx".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => panic!("short-lived command should still start successfully: {err}"),
+        };
+
+        match command.fx_status(&mut process).await {
+            Ok(FxExecutionState::Running(_)) | Ok(FxExecutionState::Exited(_)) => {}
+            Ok(state) => panic!("unexpected state for short-lived child: {state:?}"),
+            Err(state) => panic!("status should not fail for short-lived child: {state:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pid_files_allow_identical_commands_to_spawn_separately() {
+        let pid_dir = std::env::temp_dir().join(format!("becky-system-command-identical-{}", std::process::id()));
+        let mut command_a = FxSystemCommand::new("sleep".to_string(), vec!["10".to_string()], FxDesiredExecutionState::Running);
+        command_a.pid_directory = Some(pid_dir.clone());
+        let mut command_b = command_a.clone();
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+
+        let mut process_a = match command_a
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("a".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => panic!("first command should start: {err}"),
+        };
+        let mut process_b = match command_b
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("b".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => panic!("second command should start: {err}"),
+        };
+
+        assert_ne!(process_a.get_pid(), process_b.get_pid());
+
+        if let Err(err) = process_a.destroy().await {
+            panic!("first command should be destroyed: {err}");
+        }
+        if let Err(err) = process_b.destroy().await {
+            panic!("second command should be destroyed: {err}");
+        }
+        let _ = tokio::fs::remove_dir_all(pid_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_reattaches_from_matching_pid_file() {
+        let pid_dir = std::env::temp_dir().join(format!("becky-system-command-reattach-{}", std::process::id()));
+        let script = format!("while :; do sleep 1; done # becky-system-command-reattach-{}", std::process::id());
+        let mut child = match tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => panic!("test child should spawn: {err}"),
+        };
+        let Some(pid) = child.id() else {
+            let _ = child.kill().await;
+            panic!("test child should have a pid");
+        };
+
+        let mut command = FxSystemCommand::new("/bin/sh".to_string(), vec!["-c".to_string(), script], FxDesiredExecutionState::Running);
+        command.pid_directory = Some(pid_dir.clone());
+        let fx_id = FxId::String("reattach".to_string());
+        let Some(path) = pid_file_path(&command, &fx_id) else {
+            let _ = child.kill().await;
+            panic!("pid file path should exist");
+        };
+        if let Err(err) = write_pid_file(&path, pid).await {
+            let _ = child.kill().await;
+            panic!("pid file should be written: {err}");
+        }
+
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+        let process = match command
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &fx_id,
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => {
+                let _ = child.kill().await;
+                panic!("command should reattach from pid file: {err}");
+            }
+        };
+
+        match process {
+            FxSystemProcessRunning::Pid(found_pid) => assert_eq!(found_pid, pid),
+            FxSystemProcessRunning::Tokio(_) => panic!("pid file reattach should return pid-only handle"),
+        }
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = tokio::fs::remove_dir_all(pid_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_waits_for_attached_pid_to_exit() {
+        let unique = format!("becky-system-command-pid-destroy-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let mut child = match tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => panic!("test child should spawn: {err}"),
+        };
+
+        let Some(pid) = child.id() else {
+            let _ = child.kill().await;
+            panic!("test child should have a pid");
+        };
+        let mut process = FxSystemProcessRunning::Pid(pid);
+
+        if let Err(err) = process.destroy().await {
+            panic!("destroy should wait for attached pid exit: {err}");
+        }
+
+        assert!(!process_exists(pid));
+        match child.try_wait() {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(err) => panic!("child handle should remain usable after destroy: {err}"),
+        }
     }
 
     #[cfg(unix)]
