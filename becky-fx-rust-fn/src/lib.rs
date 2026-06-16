@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Command-line marker used to enter Rust-function worker mode.
 pub const DEFAULT_WORKER_ARG: &str = "--becky-rust-fn";
@@ -403,7 +403,12 @@ impl FxControl for FxRustFn {
 
         let mut child = command.spawn()?;
         let pid = child.id().ok_or(RustFnError::MissingPid)?;
-        self.write_pid_file(pid).await?;
+        if let Err(err) = self.write_pid_file(pid).await {
+            if let Err(kill_err) = child.kill().await {
+                warn!("rust-fn failed to clean up worker after pid-file error pid:{} error:{}", pid, kill_err);
+            }
+            return Err(err);
+        }
         info!("rust-fn spawned function:{} pid:{}", self.function, pid);
         let latest_state = Arc::new(RwLock::new(FxExecutionState::Running(pid)));
         let (cancel_monitor, mut cancel_rx) = tokio::sync::mpsc::channel(1);
@@ -593,6 +598,9 @@ pub fn pid_file_path(run_dir: &Path, function: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use becky_engine::empty_implementations::Metadataless;
+    use becky_engine::machine_conf::ResourceConstraintless;
+    use becky_engine::storage::Storageless;
 
     struct SuccessFn;
 
@@ -637,5 +645,54 @@ mod tests {
         let cmd = vec!["/tmp/app", DEFAULT_WORKER_ARG, "work"];
         assert!(process_cmd_contains_worker(&cmd, DEFAULT_WORKER_ARG, "work"));
         assert!(!process_cmd_contains_worker(&cmd, DEFAULT_WORKER_ARG, "other"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_cleans_up_child_when_pid_file_write_fails() {
+        let unique = format!("becky-rust-fn-cleanup-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let run_dir = std::env::temp_dir().join(format!("{unique}.run-dir-file"));
+        let _ = tokio::fs::remove_file(&run_dir).await;
+        let _ = tokio::fs::remove_dir_all(&run_dir).await;
+        if let Err(err) = tokio::fs::write(&run_dir, "not a directory").await {
+            panic!("test run_dir file should be created: {err}");
+        }
+
+        let mut fx = FxRustFn::new(script.clone(), &run_dir);
+        fx.executable = Some(PathBuf::from("/bin/sh"));
+        fx.worker_arg = "-c".to_string();
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+
+        let result = fx
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("fx".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RustFnError::Io(_))));
+        for _ in 0..20 {
+            if !matching_worker_process_exists("-c", &script) {
+                let _ = tokio::fs::remove_file(&run_dir).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = tokio::fs::remove_file(&run_dir).await;
+        assert!(!matching_worker_process_exists("-c", &script));
+    }
+
+    #[cfg(unix)]
+    fn matching_worker_process_exists(worker_arg: &str, function: &str) -> bool {
+        System::new_all()
+            .processes()
+            .values()
+            .any(|process| process_cmd_contains_worker(process.cmd(), worker_arg, function))
     }
 }
