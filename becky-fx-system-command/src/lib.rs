@@ -307,6 +307,12 @@ impl FxSystemProcessRunning {
     }
 }
 
+async fn cleanup_spawned_child(mut child: tokio::process::Child) {
+    if let Err(err) = child.kill().await {
+        error!("failed to clean up spawned child after start error: {err}");
+    }
+}
+
 fn signal_process(pid: u32, signal: sysinfo::Signal) -> Result<(), FxSysCommandError> {
     let s = System::new_all();
     if let Some(process) = s.process(Pid::from_u32(pid)) {
@@ -598,11 +604,11 @@ impl FxControl for FxSystemCommand {
                 }
 
                 let maybe_pid = child.id();
-                let shared_child = Arc::new(RwLock::new(child));
 
                 let pid = match maybe_pid {
                     None => {
                         self.state = FxExecutionState::Unknown;
+                        cleanup_spawned_child(child).await;
                         return Err(FxSysCommandError::String("pid is None".to_string()));
                     }
                     Some(found_pid) => {
@@ -613,16 +619,19 @@ impl FxControl for FxSystemCommand {
                                 info!("spawned process {} {:?} at pid {:?}", self.command, self.args, found_pid);
                                 found_pid
                             } else {
+                                cleanup_spawned_child(child).await;
                                 return Err(FxSysCommandError::String(format!(
                                     "pid {} does not match command {:?}",
                                     found_pid, self.command
                                 )));
                             }
                         } else {
+                            cleanup_spawned_child(child).await;
                             return Err(FxSysCommandError::String(format!("pid {} does not exist", found_pid)));
                         }
                     }
                 };
+                let shared_child = Arc::new(RwLock::new(child));
                 let value = shared_child.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(1);
                 let handle = tokio::spawn(async move {
@@ -830,6 +839,36 @@ mod tests {
             FxSystemProcessRunning::Tokio(handle) => assert!(handle.handle.is_none()),
             FxSystemProcessRunning::Pid(_) => panic!("test should spawn a tokio child"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_cleans_up_child_when_post_spawn_validation_fails() {
+        let unique = format!("becky-system-command-start-cleanup-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let mut command = FxSystemCommand::new("/bin/sh".to_string(), vec!["-c".to_string(), script.clone()], FxDesiredExecutionState::Running);
+        command.nice_level = Some(NiceLevel::default_priority());
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+
+        let result = command
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("fx".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await;
+
+        assert!(matches!(result, Err(FxSysCommandError::String(_))));
+        for _ in 0..20 {
+            if !matching_process_exists("nice", &["-n", "0", "/bin/sh", "-c", &script]) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!matching_process_exists("nice", &["-n", "0", "/bin/sh", "-c", &script]));
     }
 
     #[cfg(unix)]
