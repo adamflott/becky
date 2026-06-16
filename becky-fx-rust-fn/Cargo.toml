@@ -22,9 +22,5 @@ tracing = { workspace = true }
 [lints]
 workspace = true
 
-[features]
-default = ["serde"]
-serde = []
-
 [package.metadata.release]
 tag = false
