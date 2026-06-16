@@ -8,7 +8,7 @@
 pub mod boot_methods;
 pub mod control;
 pub mod cpu;
-pub mod empy_implementations;
+pub mod empty_implementations;
 pub mod exit_codes;
 pub mod host;
 pub mod host_id;

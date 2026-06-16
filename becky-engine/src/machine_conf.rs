@@ -1,6 +1,6 @@
 //! Resource and machine configuration types for managed effects.
 
-use crate::empy_implementations::Metadataless;
+use crate::empty_implementations::Metadataless;
 use crate::metadata::MetadataManager;
 use crate::os::{OsImageFileType, SupportedOs};
 use bon::Builder;

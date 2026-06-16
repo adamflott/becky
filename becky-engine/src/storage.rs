@@ -364,7 +364,7 @@ impl SysStorage for StorageFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::empy_implementations::Metadataless;
+    use crate::empty_implementations::Metadataless;
     use crate::host_id::HostId;
     use crate::machine_conf::ResourceConstraintless;
 

@@ -10,7 +10,7 @@ use crate::img_json::{FormatSpecificRoot, QemuImgInfo};
 use crate::storage_qcow::{QEMU_IMG_FILE_EXIT_RAW, QEMU_IMG_FILE_EXT_QCOW2, QEMU_IMG_FORMAT_QCOW2, QEMU_IMG_FORMAT_RAW, QcowOptions, is_qcow_image_corrupt};
 use async_trait::async_trait;
 use becky_engine::boot_methods::BootMethod;
-use becky_engine::empy_implementations::Metadataless;
+use becky_engine::empty_implementations::Metadataless;
 use becky_engine::host_id::HostId;
 use becky_engine::machine_conf::{
     BootStrapMethod, FxResourceConstraints, NetworkingConfiguration, StorageConfigurationCloudImage, StorageConfigurationDisk, StorageConfigurationIso,
@@ -1024,7 +1024,7 @@ pub enum AllocateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use becky_engine::empy_implementations::Metadataless;
+    use becky_engine::empty_implementations::Metadataless;
     use becky_engine::host_id::HostId;
     use becky_engine::machine_conf::StorageConfigurationDisk;
     use becky_engine::storage::{StorageResizeRequest, StorageResizeRequestDirection, SysStorage};

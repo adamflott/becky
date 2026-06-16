@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use becky_engine::control::FxControl;
-use becky_engine::empy_implementations::Metadataless;
+use becky_engine::empty_implementations::Metadataless;
 use becky_engine::host_id::HostId;
 use becky_engine::machine_conf::ResourceConstraintless;
 use becky_engine::storage::Storageless;
