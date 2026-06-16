@@ -6,7 +6,7 @@ pub mod manager;
 pub mod storage_qcow;
 pub mod utils;
 
-use crate::img_json::{QemuImgInfo};
+use crate::img_json::QemuImgInfo;
 use crate::storage_qcow::{QEMU_IMG_FILE_EXIT_RAW, QEMU_IMG_FILE_EXT_QCOW2, QEMU_IMG_FORMAT_QCOW2, QEMU_IMG_FORMAT_RAW, QcowOptions, is_qcow_image_corrupt};
 use async_trait::async_trait;
 use becky_engine::boot_methods::BootMethod;
