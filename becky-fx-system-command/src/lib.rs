@@ -313,6 +313,11 @@ async fn cleanup_spawned_child(mut child: tokio::process::Child) {
     }
 }
 
+async fn create_stdio_file(path: &PathBuf) -> Result<Stdio, FxSysCommandError> {
+    let file = tokio::fs::File::create(path).await?;
+    Ok(Stdio::from(file.into_std().await))
+}
+
 fn signal_process(pid: u32, signal: sysinfo::Signal) -> Result<(), FxSysCommandError> {
     let s = System::new_all();
     if let Some(process) = s.process(Pid::from_u32(pid)) {
@@ -570,7 +575,7 @@ impl FxControl for FxSystemCommand {
 
                 match &self.stderr_path {
                     Some(path) => {
-                        proc.stderr(Stdio::from(std::fs::File::create(path)?));
+                        proc.stderr(create_stdio_file(path).await?);
                     }
                     None => {
                         proc.stderr(Stdio::null());
@@ -578,7 +583,7 @@ impl FxControl for FxSystemCommand {
                 }
                 match &self.stdout_path {
                     Some(path) => {
-                        proc.stdout(Stdio::from(std::fs::File::create(path)?));
+                        proc.stdout(create_stdio_file(path).await?);
                     }
                     None => {
                         proc.stdout(Stdio::null());
