@@ -163,8 +163,8 @@ pub struct FxSystemCommand {
 }
 
 pub struct SystemProcessRunningTokio {
-    handle: JoinHandle<tokio::io::Result<ExitStatus>>,
-    _tx: Sender<()>,
+    handle: Option<JoinHandle<tokio::io::Result<ExitStatus>>>,
+    tx: Option<Sender<()>>,
     pid: u32,
     child: Arc<RwLock<tokio::process::Child>>,
 }
@@ -254,7 +254,7 @@ impl Debug for FxSystemProcessRunning {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             FxSystemProcessRunning::Tokio(handle) => {
-                write!(f, "tokio process: {:?} pid:{}", handle.handle, handle.pid)
+                write!(f, "tokio process: {:?} pid:{}", handle.handle.as_ref(), handle.pid)
             }
             FxSystemProcessRunning::Pid(pid) => {
                 write!(f, "pid process: {:?}", pid)
@@ -284,9 +284,24 @@ impl FxSystemProcessRunning {
     }
 
     /// Sends `SIGKILL` to the tracked process.
-    pub fn destroy(&self) -> Result<(), FxSysCommandError> {
+    pub async fn destroy(&mut self) -> Result<(), FxSysCommandError> {
         match self {
-            FxSystemProcessRunning::Tokio(handle) => signal_process_group(handle.pid, libc::SIGKILL),
+            FxSystemProcessRunning::Tokio(handle) => {
+                signal_process_group(handle.pid, libc::SIGKILL)?;
+                let _ = handle.tx.take();
+                match handle.handle.take() {
+                    Some(waiter) => match waiter.await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(err)) => Err(FxSysCommandError::IO(err)),
+                        Err(err) => Err(FxSysCommandError::String(format!("destroy waiter task failed: {err}"))),
+                    },
+                    None => match handle.child.write().await.wait().await {
+                        Ok(_) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+                        Err(err) => Err(FxSysCommandError::IO(err)),
+                    },
+                }
+            }
             FxSystemProcessRunning::Pid(pid) => signal_process(*pid, sysinfo::Signal::Kill),
         }
     }
@@ -619,8 +634,8 @@ impl FxControl for FxSystemCommand {
                 });
 
                 let handle = SystemProcessRunningTokio {
-                    handle,
-                    _tx: tx,
+                    handle: Some(handle),
+                    tx: Some(tx),
                     pid,
                     child: shared_child,
                 };
@@ -679,7 +694,7 @@ impl FxControl for FxSystemCommand {
     // send sigkill
     /// Force process termination with `SIGKILL`.
     async fn fx_destroy(&self, process: &mut Self::FxSpawnResult) -> Result<Self::FxDestroyResult, Self::FxDestroyError> {
-        process.destroy()
+        process.destroy().await
     }
 
     type FxArchiveResult = ();
@@ -728,6 +743,9 @@ impl FxAccounting for FxSystemCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use becky_engine::empty_implementations::Metadataless;
+    use becky_engine::machine_conf::ResourceConstraintless;
+    use becky_engine::storage::Storageless;
     use std::ffi::OsString;
 
     #[test]
@@ -777,5 +795,49 @@ mod tests {
         let cmd_a_args = vec![];
         let cmd_b: Vec<OsString> = vec![];
         assert!(!command_equal(cmd_a, &cmd_a_args, &cmd_b));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_kills_tokio_child_and_joins_waiter() {
+        let unique = format!("becky-system-command-destroy-{}", std::process::id());
+        let script = format!("while :; do sleep 1; done # {unique}");
+        let mut command = FxSystemCommand::new("/bin/sh".to_string(), vec!["-c".to_string(), script.clone()], FxDesiredExecutionState::Running);
+        let mut metadata = Metadataless {};
+        let mut storage = Storageless {};
+
+        let mut process = match command
+            .fx_start(
+                &HostId::String("host".to_string()),
+                &FxId::String("fx".to_string()),
+                &mut metadata,
+                &ResourceConstraintless,
+                &mut storage,
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(err) => panic!("system command should start: {err}"),
+        };
+
+        assert!(matching_process_exists("/bin/sh", &["-c", &script]));
+        if let Err(err) = command.fx_destroy(&mut process).await {
+            panic!("system command should be destroyed: {err}");
+        }
+
+        assert!(!matching_process_exists("/bin/sh", &["-c", &script]));
+        match process {
+            FxSystemProcessRunning::Tokio(handle) => assert!(handle.handle.is_none()),
+            FxSystemProcessRunning::Pid(_) => panic!("test should spawn a tokio child"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn matching_process_exists(command: &str, args: &[&str]) -> bool {
+        let expected_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+        System::new_all()
+            .processes()
+            .values()
+            .any(|process| command_equal(command, &expected_args, process.cmd()))
     }
 }
